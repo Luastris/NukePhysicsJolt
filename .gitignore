@@ -1,0 +1,34 @@
+# Build output
+build/
+[Bb]in/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.dll
+*.tlog
+*.lastbuildstate
+
+# Vendored Jolt v5.5.0 (deps/JoltPhysics, release archive — no upstream .git).
+# Track ONLY what our build consumes: Jolt/ (library source), Build/ (CMake),
+# LICENSE + README. Samples, unit/perf tests, viewer, assets and docs (~30 MB)
+# stay local-only; our CMakeLists.txt turns all those targets OFF anyway.
+deps/*
+!deps/JoltPhysics/
+deps/JoltPhysics/*
+!deps/JoltPhysics/Jolt/
+!deps/JoltPhysics/Build/
+!deps/JoltPhysics/LICENSE
+!deps/JoltPhysics/README.md
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+
+# logs / OS
+*.log
+Thumbs.db
+.DS_Store
