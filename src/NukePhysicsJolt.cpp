@@ -50,7 +50,7 @@ using std::endl;
 using namespace nuke;
 
 // ---- Jolt collision layers: static world vs everything that moves -------------------
-namespace Layers
+namespace ObjLayers   // Jolt OBJECT layers (renamed: nuke::Layers are the engine's RENDER layers)
 {
 	static constexpr JPH::ObjectLayer NON_MOVING = 0;
 	static constexpr JPH::ObjectLayer MOVING     = 1;
@@ -69,7 +69,7 @@ public:
 	JPH::uint GetNumBroadPhaseLayers() const override { return BPLayers::NUM_LAYERS; }
 	JPH::BroadPhaseLayer GetBroadPhaseLayer(JPH::ObjectLayer layer) const override
 	{
-		return layer == Layers::NON_MOVING ? BPLayers::NON_MOVING : BPLayers::MOVING;
+		return layer == ObjLayers::NON_MOVING ? BPLayers::NON_MOVING : BPLayers::MOVING;
 	}
 #if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 	const char* GetBroadPhaseLayerName(JPH::BroadPhaseLayer layer) const override
@@ -85,7 +85,7 @@ public:
 	bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bpLayer) const override
 	{
 		// Statics never collide with statics; everything else collides.
-		return layer != Layers::NON_MOVING || bpLayer != BPLayers::NON_MOVING;
+		return layer != ObjLayers::NON_MOVING || bpLayer != BPLayers::NON_MOVING;
 	}
 };
 
@@ -94,7 +94,7 @@ class ObjectLayerPairFilterImpl final : public JPH::ObjectLayerPairFilter
 public:
 	bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override
 	{
-		return a != Layers::NON_MOVING || b != Layers::NON_MOVING;
+		return a != ObjLayers::NON_MOVING || b != ObjLayers::NON_MOVING;
 	}
 };
 
@@ -352,7 +352,7 @@ public:
 		const JPH::EMotionType motion = motionCode == 1 ? JPH::EMotionType::Dynamic
 		                              : motionCode == 2 ? JPH::EMotionType::Kinematic
 		                                                : JPH::EMotionType::Static;
-		const JPH::ObjectLayer layer = motionCode == 0 ? Layers::NON_MOVING : Layers::MOVING;
+		const JPH::ObjectLayer layer = motionCode == 0 ? ObjLayers::NON_MOVING : ObjLayers::MOVING;
 
 		JPH::BodyCreationSettings bcs(shape,
 			JPH::RVec3(d.pos[0], d.pos[1], d.pos[2]),
