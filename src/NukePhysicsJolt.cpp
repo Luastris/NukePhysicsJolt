@@ -23,12 +23,15 @@
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyLockInterface.h>
+#include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
+#include <Jolt/Physics/Character/CharacterVirtual.h>
 
 // Engine headers last (they do `using namespace std;` internally).
 #include <interface/NUKEEInteface.h>   // NUKEModule (unified plugin model)
@@ -42,6 +45,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <map>
 #include <unordered_set>
 #include <vector>
 
@@ -267,6 +271,10 @@ public:
 	void reset() override
 	{
 		if (!m_system) return;
+		// Characters first: their inner bodies die with them, before the body sweep below.
+		for (auto& kv : m_characters)
+			m_charVsChar.Remove(kv.second.character);
+		m_characters.clear();
 		JPH::BodyInterface& bi = m_system->GetBodyInterface();
 		for (JPH::uint32 raw : m_bodies)
 		{
@@ -364,12 +372,13 @@ public:
 		bcs.mAngularDamping = d.angularDamping;
 		bcs.mGravityFactor  = d.useGravity ? 1.0f : 0.0f;
 		bcs.mIsSensor       = d.isTrigger;   // sensor: contact events, no collision response
-		if (motion == JPH::EMotionType::Kinematic && d.shape == 3 && !d.convex)
+		if (motion != JPH::EMotionType::Static && d.shape == 3)
 		{
-			// A triangle-soup MeshShape cannot derive its own mass - creating the motion
-			// properties would assert and then crash (null MotionProperties). Kinematic
-			// bodies don't integrate forces, so a solid box of the mesh bounds is exact
-			// enough; it only matters if something reads the mass.
+			// MESH-based moving bodies can't derive their own mass: a triangle-soup
+			// MeshShape has none at all, and a convex hull of DEGENERATE geometry (a flat
+			// plane) has zero volume — either way the motion properties would assert and
+			// crash. A solid box of the shape's bounds is exact enough for both kinematic
+			// and dynamic use.
 			const JPH::AABox bounds = shape->GetLocalBounds();
 			const JPH::Vec3 size = JPH::Vec3::sMax(bounds.GetSize(), JPH::Vec3::sReplicate(0.01f));
 			bcs.mOverrideMassProperties = JPH::EOverrideMassProperties::MassAndInertiaProvided;
@@ -499,7 +508,165 @@ public:
 	void step(float dt) override
 	{
 		if (!m_system) return;
+		// Characters step FIRST (their pushes land on the bodies this same step). A
+		// CharacterVirtual is not tracked by the PhysicsSystem — ExtendedUpdate is the
+		// whole move: slide along walls, walk stairs (mWalkStairsStepUp), stay glued
+		// going down (mStickToFloorStepDown), push dynamics, collide with other characters.
+		for (auto& kv : m_characters)
+		{
+			CharRec& c = kv.second;
+			c.character->SetLinearVelocity(c.desiredVel);
+			JPH::CharacterVirtual::ExtendedUpdateSettings us;
+			const JPH::Vec3 up = c.character->GetUp();
+			us.mWalkStairsStepUp     = up * c.stepHeight;
+			us.mStickToFloorStepDown = -up * c.stickDistance;
+			c.character->ExtendedUpdate(dt, m_system->GetGravity(), us,
+				m_system->GetDefaultBroadPhaseLayerFilter(ObjLayers::MOVING),
+				m_system->GetDefaultLayerFilter(ObjLayers::MOVING),
+				{}, {}, *m_tempAllocator);
+			// Refresh the ground's own velocity AFTER the move so the driver composes the
+			// NEXT step against the platform's current motion, not last step's.
+			c.character->UpdateGroundVelocity();
+		}
 		m_system->Update(dt, 1, m_tempAllocator.get(), m_jobSystem.get());
+	}
+
+	// ---- characters (iPhysics vtable END) ---------------------------------------------
+
+	uint64_t createCharacter(const NukeCharacterDesc& d) override
+	{
+		if (!m_system) return 0;
+		// Capsule with the PIVOT AT THE FEET: the shape is lifted by halfHeight+radius so
+		// the character's position is where it stands (transforms map 1:1).
+		const float lift = d.halfHeight + d.radius;
+		JPH::RefConst<JPH::Shape> capsule = new JPH::CapsuleShape(d.halfHeight, d.radius);
+		JPH::ShapeSettings::ShapeResult shape = JPH::RotatedTranslatedShapeSettings(
+			JPH::Vec3(0, lift, 0), JPH::Quat::sIdentity(), capsule).Create();
+		if (shape.HasError())
+		{
+			cout << "[NukePhysicsJolt]\tcharacter shape failed: " << shape.GetError() << endl;
+			return 0;
+		}
+		JPH::Ref<JPH::CharacterVirtualSettings> cs = new JPH::CharacterVirtualSettings();
+		cs->mShape            = shape.Get();
+		cs->mUp               = JPH::Vec3(d.up[0], d.up[1], d.up[2]).NormalizedOr(JPH::Vec3::sAxisY());
+		cs->mMaxSlopeAngle    = JPH::DegreesToRadians(d.maxSlopeDeg);
+		cs->mMass             = d.mass;
+		cs->mMaxStrength      = d.maxStrength;
+		cs->mCharacterPadding = d.padding;
+		// Only the bottom sphere carries the character — prevents "standing" on a wall
+		// edge that touches the capsule's side.
+		cs->mSupportingVolume = JPH::Plane(cs->mUp, -d.radius);
+		if (d.innerBody)
+		{
+			// A kinematic capsule BODY rides at the character's pose: raycasts, shape
+			// queries and contact events see the character like any other body.
+			cs->mInnerBodyShape = shape.Get();
+			cs->mInnerBodyLayer = ObjLayers::MOVING;
+		}
+		CharRec rec;
+		rec.character = new JPH::CharacterVirtual(cs, JPH::RVec3(d.pos[0], d.pos[1], d.pos[2]),
+		                                          JPH::Quat::sIdentity(), 0, m_system.get());
+		rec.character->SetCharacterVsCharacterCollision(&m_charVsChar);
+		m_charVsChar.Add(rec.character);
+		rec.stepHeight    = d.stepHeight;
+		rec.stickDistance = d.stickDistance;
+		const uint64_t id = m_nextCharId++;
+		m_characters[id] = rec;
+		return id;
+	}
+
+	void destroyCharacter(uint64_t ch) override
+	{
+		auto it = m_characters.find(ch);
+		if (it == m_characters.end()) return;
+		m_charVsChar.Remove(it->second.character);
+		m_characters.erase(it);   // Ref release destroys the character + its inner body
+	}
+
+	void setCharacterVelocity(uint64_t ch, const float v[3]) override
+	{
+		auto it = m_characters.find(ch);
+		if (it != m_characters.end()) it->second.desiredVel = JPH::Vec3(v[0], v[1], v[2]);
+	}
+
+	void getCharacterVelocity(uint64_t ch, float v[3]) override
+	{
+		v[0] = v[1] = v[2] = 0;
+		auto it = m_characters.find(ch);
+		if (it == m_characters.end()) return;
+		const JPH::Vec3 lv = it->second.character->GetLinearVelocity();
+		v[0] = lv.GetX(); v[1] = lv.GetY(); v[2] = lv.GetZ();
+	}
+
+	void setCharacterPosition(uint64_t ch, const float pos[3]) override
+	{
+		auto it = m_characters.find(ch);
+		if (it != m_characters.end())
+			it->second.character->SetPosition(JPH::RVec3(pos[0], pos[1], pos[2]));
+	}
+
+	bool getCharacterState(uint64_t ch, float pos[3], int& groundState,
+	                       float groundNormal[3], float groundVel[3], uint64_t& groundBody) override
+	{
+		auto it = m_characters.find(ch);
+		if (it == m_characters.end()) return false;
+		JPH::CharacterVirtual* c = it->second.character;
+		const JPH::RVec3 p = c->GetPosition();
+		pos[0] = (float)p.GetX(); pos[1] = (float)p.GetY(); pos[2] = (float)p.GetZ();
+		groundState = (int)c->GetGroundState();   // enum orders match (On/Steep/Unsupported/Air)
+		const JPH::Vec3 n = c->GetGroundNormal();
+		groundNormal[0] = n.GetX(); groundNormal[1] = n.GetY(); groundNormal[2] = n.GetZ();
+		const JPH::Vec3 gv = c->GetGroundVelocity();
+		groundVel[0] = gv.GetX(); groundVel[1] = gv.GetY(); groundVel[2] = gv.GetZ();
+		groundBody = c->GetGroundBodyID().GetIndexAndSequenceNumber();
+		return true;
+	}
+
+	void setCharacterParams(uint64_t ch, float maxSlopeDeg, float stepHeight, float stickDistance) override
+	{
+		auto it = m_characters.find(ch);
+		if (it == m_characters.end()) return;
+		it->second.character->SetMaxSlopeAngle(JPH::DegreesToRadians(maxSlopeDeg));
+		it->second.stepHeight    = stepHeight;
+		it->second.stickDistance = stickDistance;
+	}
+
+	uint64_t characterBodyId(uint64_t ch) override
+	{
+		auto it = m_characters.find(ch);
+		if (it == m_characters.end()) return 0;
+		const JPH::BodyID inner = it->second.character->GetInnerBodyID();
+		return inner.IsInvalid() ? 0 : inner.GetIndexAndSequenceNumber();
+	}
+
+	bool raycastIgnore(const float from[3], const float dir[3], float maxDist, uint64_t ignoreBody,
+	                   uint64_t& hitBody, float hitPoint[3], float hitNormal[3]) override
+	{
+		if (!m_system) return false;
+		JPH::Vec3 d(dir[0], dir[1], dir[2]);
+		if (d.LengthSq() < 1e-12f || maxDist <= 0.0f) return false;
+		d = d.Normalized() * maxDist;
+		JPH::RRayCast ray{ JPH::RVec3(from[0], from[1], from[2]), d };
+		JPH::ClosestHitCollisionCollector<JPH::CastRayCollector> collector;
+		JPH::IgnoreSingleBodyFilter ignore{ JPH::BodyID((JPH::uint32)ignoreBody) };
+		m_system->GetNarrowPhaseQuery().CastRay(ray, JPH::RayCastSettings{}, collector,
+		                                        {}, {}, ignore);
+		if (!collector.HadHit()) return false;
+		const JPH::RayCastResult& hit = collector.mHit;
+		hitBody = hit.mBodyID.GetIndexAndSequenceNumber();
+		JPH::RVec3 p = ray.GetPointOnRay(hit.mFraction);
+		hitPoint[0] = (float)p.GetX(); hitPoint[1] = (float)p.GetY(); hitPoint[2] = (float)p.GetZ();
+		hitNormal[0] = hitNormal[1] = hitNormal[2] = 0.0f;
+		{
+			JPH::BodyLockRead lock(m_system->GetBodyLockInterface(), hit.mBodyID);
+			if (lock.Succeeded())
+			{
+				JPH::Vec3 n = lock.GetBody().GetWorldSpaceSurfaceNormal(hit.mSubShapeID2, p);
+				hitNormal[0] = n.GetX(); hitNormal[1] = n.GetY(); hitNormal[2] = n.GetZ();
+			}
+		}
+		return true;
 	}
 
 	bool raycast(const float from[3], const float dir[3], float maxDist,
@@ -532,6 +699,13 @@ public:
 	               const float dir[3], float maxDist,
 	               uint64_t& hitBody, float hitPoint[3], float hitNormal[3]) override
 	{
+		return shapeCastIgnore(s, from, quat, dir, maxDist, 0, hitBody, hitPoint, hitNormal);
+	}
+
+	bool shapeCastIgnore(const NukeShapeDesc& s, const float from[3], const float quat[4],
+	                     const float dir[3], float maxDist, uint64_t ignoreBody,
+	                     uint64_t& hitBody, float hitPoint[3], float hitNormal[3]) override
+	{
 		if (!m_system) return false;
 		JPH::Vec3 d(dir[0], dir[1], dir[2]);
 		if (d.LengthSq() < 1e-12f || maxDist <= 0.0f) return false;
@@ -544,7 +718,9 @@ public:
 		JPH::RShapeCast cast(shape, JPH::Vec3::sReplicate(1.0f), start, d);
 		JPH::ShapeCastSettings settings;
 		JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> collector;
-		m_system->GetNarrowPhaseQuery().CastShape(cast, settings, JPH::RVec3::sZero(), collector);
+		JPH::IgnoreSingleBodyFilter ignore{ JPH::BodyID((JPH::uint32)ignoreBody) };
+		m_system->GetNarrowPhaseQuery().CastShape(cast, settings, JPH::RVec3::sZero(), collector,
+		                                          {}, {}, ignore);
 		if (!collector.HadHit()) return false;
 
 		const JPH::ShapeCastResult& hit = collector.mHit;
@@ -613,6 +789,17 @@ private:
 	std::unique_ptr<NukeJobSystem>             m_jobSystem;   // solver jobs on nuke::Jobs (2.4)
 	std::unique_ptr<JPH::PhysicsSystem>        m_system;
 	std::unordered_set<JPH::uint32>            m_bodies;      // live handles (reset/validation)
+
+	// Character controllers (virtual capsules stepped in step(); see iPhysics).
+	struct CharRec
+	{
+		JPH::Ref<JPH::CharacterVirtual> character;
+		JPH::Vec3 desiredVel = JPH::Vec3::sZero();
+		float stepHeight = 0.35f, stickDistance = 0.5f;
+	};
+	std::map<uint64_t, CharRec>                m_characters;
+	uint64_t                                   m_nextCharId = 1;
+	JPH::CharacterVsCharacterCollisionSimple   m_charVsChar;  // characters collide with each other
 };
 static JoltPhysics gPhysics;
 
