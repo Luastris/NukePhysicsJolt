@@ -505,6 +505,23 @@ public:
 		m_system->GetBodyInterface().AddImpulse(JPH::BodyID((JPH::uint32)handle), JPH::Vec3(i[0], i[1], i[2]));
 	}
 
+	// --- water/buoyancy (7.5): per-probe forces + point velocities -------------------------
+	void addForceAtPoint(uint64_t handle, const float f[3], const float p[3]) override
+	{
+		if (!m_system || !handle) return;
+		m_system->GetBodyInterface().AddForce(JPH::BodyID((JPH::uint32)handle),
+		                                      JPH::Vec3(f[0], f[1], f[2]), JPH::RVec3(p[0], p[1], p[2]));
+	}
+
+	void getPointVelocity(uint64_t handle, const float p[3], float outVel[3]) override
+	{
+		outVel[0] = outVel[1] = outVel[2] = 0.0f;
+		if (!m_system || !handle) return;
+		JPH::Vec3 v = m_system->GetBodyInterface().GetPointVelocity(JPH::BodyID((JPH::uint32)handle),
+		                                                            JPH::RVec3(p[0], p[1], p[2]));
+		outVel[0] = v.GetX(); outVel[1] = v.GetY(); outVel[2] = v.GetZ();
+	}
+
 	void step(float dt) override
 	{
 		if (!m_system) return;
