@@ -1,11 +1,6 @@
-// NukePhysicsJolt — the physics service provider (roadmap 1.1).
-//
-// An ordinary plugin (unified model): exports "plugin", provides()="physics",
-// queryService() returns the iPhysics implementation. The ENGINE owns the fixed-step
-// loop and the Collider/Rigidbody components (World::UpdatePhysics); this module only
-// simulates behind the POD seam (service/iPhysics.h). Links NukeEngine.dll (import
-// lib) — plugins EXTEND the engine, so engine API like nuke::Jobs is used directly.
-// Jolt v5.5.0 is vendored statically (deps/JoltPhysics).
+// NukePhysicsJolt — the "physics" service provider (iPhysics behind the POD seam
+// service/iPhysics.h). The engine owns the fixed-step loop and the Collider/Rigidbody
+// components; this module only simulates. Jolt v5.5.0 is vendored statically.
 
 // Jolt first (its headers configure themselves via compile definitions from the target).
 #include <Jolt/Jolt.h>
@@ -36,7 +31,7 @@
 // Engine headers last (they do `using namespace std;` internally).
 #include <interface/NUKEEInteface.h>   // NUKEModule (unified plugin model)
 #include <service/iPhysics.h>          // the contract this module provides
-#include <API/Model/Jobs.h>            // engine worker pool (roadmap 2.4)
+#include <API/Model/Jobs.h>            // engine worker pool
 
 #include <cstdarg>
 #include <cstdio>
@@ -53,8 +48,8 @@ using std::cout;
 using std::endl;
 using namespace nuke;
 
-// ---- Jolt collision layers: static world vs everything that moves -------------------
-namespace ObjLayers   // Jolt OBJECT layers (renamed: nuke::Layers are the engine's RENDER layers)
+// ---- Jolt collision layers: static world vs everything that moves ----
+namespace ObjLayers   // Jolt OBJECT layers; nuke::Layers are the engine's RENDER layers
 {
 	static constexpr JPH::ObjectLayer NON_MOVING = 0;
 	static constexpr JPH::ObjectLayer MOVING     = 1;
@@ -88,7 +83,6 @@ class ObjectVsBroadPhaseLayerFilterImpl final : public JPH::ObjectVsBroadPhaseLa
 public:
 	bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bpLayer) const override
 	{
-		// Statics never collide with statics; everything else collides.
 		return layer != ObjLayers::NON_MOVING || bpLayer != BPLayers::NON_MOVING;
 	}
 };
@@ -102,9 +96,8 @@ public:
 	}
 };
 
-// Buffers contact transitions during PhysicsSystem::Update. Jolt calls these from its
-// WORKER threads mid-step, so the buffer is mutex-guarded; the engine drains it after
-// the step (fetchContacts) on the fixed-update thread.
+// Buffers contact transitions during PhysicsSystem::Update. Jolt calls these from its WORKER
+// threads mid-step, so the buffer is mutex-guarded; the engine drains it after the step.
 class ContactCollector final : public JPH::ContactListener
 {
 public:
@@ -148,8 +141,7 @@ private:
 	std::vector<NukeContactEvent> m_events;
 };
 
-// Primitive query/body shape factory (Box/Sphere/Capsule — shared by createBody and the
-// shape-cast/overlap queries).
+// Box/Sphere/Capsule factory shared by createBody and the shape-cast/overlap queries.
 static JPH::RefConst<JPH::Shape> MakePrimitiveShape(int shape, const float halfExtents[3],
                                                     float radius, float halfHeight)
 {
@@ -164,30 +156,27 @@ static JPH::RefConst<JPH::Shape> MakePrimitiveShape(int shape, const float halfE
 	}
 }
 
-// Jolt job system backed by the ENGINE's worker pool (roadmap 2.4): solver jobs are
-// scheduled straight onto nuke::Jobs instead of a private thread pool, so ALL parallel
-// work shares the same per-core-pinned workers. Barriers come from JobSystemWithBarrier
-// (WaitForJobs executes remaining barrier jobs on the CALLING thread, so a saturated
-// pool can never deadlock the fixed step).
+// Jolt job system backed by the engine's nuke::Jobs pool, so all parallel work shares one set
+// of workers. Barriers must come from JobSystemWithBarrier: WaitForJobs runs remaining barrier
+// jobs on the CALLING thread, which is what keeps a saturated pool from deadlocking the step.
 class NukeJobSystem final : public JPH::JobSystemWithBarrier
 {
 public:
 	NukeJobSystem(JPH::uint maxJobs, JPH::uint maxBarriers)
 	{
-		nuke::Jobs::Init();   // no-op when the host already inited (both hosts do at boot)
+		nuke::Jobs::Init();   // no-op when the host already inited
 		JobSystemWithBarrier::Init(maxBarriers);
 		m_jobs.Init(maxJobs, maxJobs);
 	}
 
 	int GetMaxConcurrency() const override
 	{
-		return nuke::Jobs::WorkerCount() + 1;   // + the calling (fixed) thread: it executes barrier jobs too
+		return nuke::Jobs::WorkerCount() + 1;   // + the calling thread: it runs barrier jobs too
 	}
 
 	JobHandle CreateJob(const char* name, JPH::ColorArg color,
 	                    const JobFunction& fn, JPH::uint32 numDependencies = 0) override
 	{
-		// Same free-list scheme as Jolt's own JobSystemThreadPool.
 		JPH::uint32 index;
 		for (;;)
 		{
@@ -198,7 +187,7 @@ public:
 			std::this_thread::sleep_for(std::chrono::microseconds(100));
 		}
 		Job* job = &m_jobs.Get(index);
-		JobHandle handle(job);           // keep a reference — the job may complete immediately
+		JobHandle handle(job);           // reference FIRST: the job may complete immediately
 		if (numDependencies == 0)
 			QueueJob(job);
 		return handle;
@@ -222,7 +211,7 @@ private:
 	AvailableJobs m_jobs;
 };
 
-// ---- iPhysics implementation ----------------------------------------------------------
+// ---- iPhysics implementation ----
 class JoltPhysics final : public iPhysics
 {
 public:
@@ -230,8 +219,8 @@ public:
 	{
 		if (m_system) return true;   // idempotent
 
-		// Route Jolt's diagnostics into the engine log — without these a Debug assert
-		// hits JPH_BREAKPOINT and kills the process SILENTLY.
+		// These hooks are REQUIRED: without them a Debug assert hits JPH_BREAKPOINT and kills
+		// the process silently.
 		JPH::Trace = [](const char* fmt, ...)
 		{
 			char buf[1024];
@@ -254,9 +243,8 @@ public:
 			JPH::Factory::sInstance = new JPH::Factory();
 			JPH::RegisterTypes();
 		}
-		// Update()'s scratch scales with kMaxBodies (16k bodies wanted ~14 MB) — 32 MB has headroom.
+		// Update()'s scratch scales with kMaxBodies: 16k bodies want ~14 MB.
 		m_tempAllocator = std::make_unique<JPH::TempAllocatorImpl>(32 * 1024 * 1024);
-		// Solver jobs run on the ENGINE's shared per-core-pinned pool (nuke::Jobs, 2.4).
 		m_jobSystem = std::make_unique<NukeJobSystem>(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers);
 
 		m_system = std::make_unique<JPH::PhysicsSystem>();
@@ -271,7 +259,7 @@ public:
 	void reset() override
 	{
 		if (!m_system) return;
-		// Characters first: their inner bodies die with them, before the body sweep below.
+		// Characters MUST go first: their inner bodies die with them, before the body sweep.
 		for (auto& kv : m_characters)
 			m_charVsChar.Remove(kv.second.character);
 		m_characters.clear();
@@ -344,7 +332,7 @@ public:
 						return 0;
 					}
 					shape = r.Get();
-					if (motionCode == 1)   // Jolt mesh shapes cannot be SIMULATED (kinematic is fine - mass provided below)
+					if (motionCode == 1)   // Jolt mesh shapes cannot be simulated (kinematic is fine)
 					{
 						cout << "[NukePhysicsJolt]\tnon-convex mesh collider cannot be DYNAMIC - forced STATIC (set convex=true for a hull)" << endl;
 						motionCode = 0;
@@ -374,11 +362,8 @@ public:
 		bcs.mIsSensor       = d.isTrigger;   // sensor: contact events, no collision response
 		if (motion != JPH::EMotionType::Static && d.shape == 3)
 		{
-			// MESH-based moving bodies can't derive their own mass: a triangle-soup
-			// MeshShape has none at all, and a convex hull of DEGENERATE geometry (a flat
-			// plane) has zero volume — either way the motion properties would assert and
-			// crash. A solid box of the shape's bounds is exact enough for both kinematic
-			// and dynamic use.
+			// Mesh-based moving bodies can't derive mass (a MeshShape has none, a degenerate
+			// hull has zero volume) and Jolt asserts — override with a solid box of the bounds.
 			const JPH::AABox bounds = shape->GetLocalBounds();
 			const JPH::Vec3 size = JPH::Vec3::sMax(bounds.GetSize(), JPH::Vec3::sReplicate(0.01f));
 			bcs.mOverrideMassProperties = JPH::EOverrideMassProperties::MassAndInertiaProvided;
@@ -428,17 +413,13 @@ public:
 			setBodyPose(handle, pos, quat);
 			return;
 		}
-		// A body that is NOT kinematic has no motion properties to derive velocities
-		// from - Body::MoveKinematic would dereference null and kill the process.
-		// Whatever the mismatch (a backend-forced static, a stale handle), degrade to
-		// a pose teleport instead of crashing.
+		// A non-kinematic body has no motion properties: Body::MoveKinematic would deref null.
 		if (m_system->GetBodyInterface().GetMotionType(id) != JPH::EMotionType::Kinematic)
 		{
 			setBodyPose(handle, pos, quat);
 			return;
 		}
-		// MoveKinematic derives linear/angular velocity for the step, so contacting
-		// dynamic bodies are CARRIED instead of left behind (moving platforms).
+		// MoveKinematic derives step velocities, so contacting dynamic bodies get carried.
 		m_system->GetBodyInterface().ActivateBody(id);
 		m_system->GetBodyInterface().MoveKinematic(id,
 			JPH::RVec3(pos[0], pos[1], pos[2]),
@@ -505,7 +486,6 @@ public:
 		m_system->GetBodyInterface().AddImpulse(JPH::BodyID((JPH::uint32)handle), JPH::Vec3(i[0], i[1], i[2]));
 	}
 
-	// --- water/buoyancy (7.5): per-probe forces + point velocities -------------------------
 	void addForceAtPoint(uint64_t handle, const float f[3], const float p[3]) override
 	{
 		if (!m_system || !handle) return;
@@ -525,10 +505,8 @@ public:
 	void step(float dt) override
 	{
 		if (!m_system) return;
-		// Characters step FIRST (their pushes land on the bodies this same step). A
-		// CharacterVirtual is not tracked by the PhysicsSystem — ExtendedUpdate is the
-		// whole move: slide along walls, walk stairs (mWalkStairsStepUp), stay glued
-		// going down (mStickToFloorStepDown), push dynamics, collide with other characters.
+		// Characters step BEFORE PhysicsSystem::Update so their pushes land the same step.
+		// A CharacterVirtual is not tracked by the system: ExtendedUpdate is the whole move.
 		for (auto& kv : m_characters)
 		{
 			CharRec& c = kv.second;
@@ -541,20 +519,18 @@ public:
 				m_system->GetDefaultBroadPhaseLayerFilter(ObjLayers::MOVING),
 				m_system->GetDefaultLayerFilter(ObjLayers::MOVING),
 				{}, {}, *m_tempAllocator);
-			// Refresh the ground's own velocity AFTER the move so the driver composes the
-			// NEXT step against the platform's current motion, not last step's.
-			c.character->UpdateGroundVelocity();
+			c.character->UpdateGroundVelocity();   // AFTER the move: next step reads current motion
 		}
 		m_system->Update(dt, 1, m_tempAllocator.get(), m_jobSystem.get());
 	}
 
-	// ---- characters (iPhysics vtable END) ---------------------------------------------
+	// ---- characters: appended at the iPhysics vtable END (ABI) ----
 
 	uint64_t createCharacter(const NukeCharacterDesc& d) override
 	{
 		if (!m_system) return 0;
-		// Capsule with the PIVOT AT THE FEET: the shape is lifted by halfHeight+radius so
-		// the character's position is where it stands (transforms map 1:1).
+		// Capsule with the PIVOT AT THE FEET: lifted by halfHeight+radius so the character's
+		// position is where it stands.
 		const float lift = d.halfHeight + d.radius;
 		JPH::RefConst<JPH::Shape> capsule = new JPH::CapsuleShape(d.halfHeight, d.radius);
 		JPH::ShapeSettings::ShapeResult shape = JPH::RotatedTranslatedShapeSettings(
@@ -571,13 +547,11 @@ public:
 		cs->mMass             = d.mass;
 		cs->mMaxStrength      = d.maxStrength;
 		cs->mCharacterPadding = d.padding;
-		// Only the bottom sphere carries the character — prevents "standing" on a wall
-		// edge that touches the capsule's side.
+		// Only the bottom sphere supports: otherwise a wall edge touching the side counts as ground.
 		cs->mSupportingVolume = JPH::Plane(cs->mUp, -d.radius);
 		if (d.innerBody)
 		{
-			// A kinematic capsule BODY rides at the character's pose: raycasts, shape
-			// queries and contact events see the character like any other body.
+			// A kinematic capsule body rides the character's pose, so queries/contacts see it.
 			cs->mInnerBodyShape = shape.Get();
 			cs->mInnerBodyLayer = ObjLayers::MOVING;
 		}
@@ -745,8 +719,7 @@ public:
 		hitPoint[0] = (float)hit.mContactPointOn2.GetX();
 		hitPoint[1] = (float)hit.mContactPointOn2.GetY();
 		hitPoint[2] = (float)hit.mContactPointOn2.GetZ();
-		// mPenetrationAxis points from the cast shape INTO the hit body; the surface normal
-		// faces back at the caster.
+		// mPenetrationAxis points from the cast shape INTO the hit body; the normal is its negation.
 		JPH::Vec3 n = hit.mPenetrationAxis;
 		if (n.LengthSq() > 1e-12f) n = -n.Normalized(); else n = JPH::Vec3::sZero();
 		hitNormal[0] = n.GetX(); hitNormal[1] = n.GetY(); hitNormal[2] = n.GetZ();
@@ -803,11 +776,11 @@ private:
 	ContactCollector                  m_contacts;
 
 	std::unique_ptr<JPH::TempAllocatorImpl>    m_tempAllocator;
-	std::unique_ptr<NukeJobSystem>             m_jobSystem;   // solver jobs on nuke::Jobs (2.4)
+	std::unique_ptr<NukeJobSystem>             m_jobSystem;   // solver jobs on nuke::Jobs
 	std::unique_ptr<JPH::PhysicsSystem>        m_system;
 	std::unordered_set<JPH::uint32>            m_bodies;      // live handles (reset/validation)
 
-	// Character controllers (virtual capsules stepped in step(); see iPhysics).
+	// Virtual-capsule character controllers, stepped in step().
 	struct CharRec
 	{
 		JPH::Ref<JPH::CharacterVirtual> character;
@@ -820,7 +793,7 @@ private:
 };
 static JoltPhysics gPhysics;
 
-// ---- Plugin export (unified plugin model) ---------------------------------------------
+// ---- plugin export ----
 struct NukePhysicsJoltModule : public NUKEModule
 {
 	NukePhysicsJoltModule()
@@ -836,7 +809,7 @@ struct NukePhysicsJoltModule : public NUKEModule
 	const char* provides() override { return "physics"; }
 	void*       queryService() override { return static_cast<iPhysics*>(&gPhysics); }
 
-	void OnLoad() override {}          // Collider/Rigidbody are ENGINE components — already registered
+	void OnLoad() override {}          // Collider/Rigidbody are ENGINE components
 	void Run(AppInstance* inst) override { instance = inst; stopped = false; }   // driven by World's fixed step
 	bool HasSettings() override { return false; }
 	void Settings() override {}
