@@ -27,6 +27,8 @@
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Character/CharacterVirtual.h>
+#include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
+#include <Jolt/Physics/Body/BodyLockMulti.h>
 
 // Engine headers last (they do `using namespace std;` internally).
 #include <interface/NUKEEInteface.h>   // NUKEModule (unified plugin model)
@@ -502,6 +504,70 @@ public:
 		outVel[0] = v.GetX(); outVel[1] = v.GetY(); outVel[2] = v.GetZ();
 	}
 
+	// ---- ragdoll joints (stage 9) ---------------------------------------------------------
+	uint64_t createSwingTwistJoint(const NukeJointDesc& d) override
+	{
+		if (!m_system || !d.bodyA || !d.bodyB) return 0;
+		const JPH::BodyID ids[2] = { JPH::BodyID((JPH::uint32)d.bodyA), JPH::BodyID((JPH::uint32)d.bodyB) };
+		JPH::BodyLockMultiWrite lock(m_system->GetBodyLockInterface(), ids, 2);
+		JPH::Body* a = lock.GetBody(0);
+		JPH::Body* b = lock.GetBody(1);
+		if (!a || !b) return 0;
+		JPH::SwingTwistConstraintSettings st;
+		st.mSpace = JPH::EConstraintSpace::WorldSpace;
+		st.mPosition1 = st.mPosition2 = JPH::RVec3(d.pivot[0], d.pivot[1], d.pivot[2]);
+		JPH::Vec3 tw(d.twistAxis[0], d.twistAxis[1], d.twistAxis[2]);
+		JPH::Vec3 pl(d.planeAxis[0], d.planeAxis[1], d.planeAxis[2]);
+		if (tw.LengthSq() < 1e-10f) tw = JPH::Vec3::sAxisY();
+		tw = tw.Normalized();
+		pl -= tw * pl.Dot(tw);   // enforce perpendicularity
+		if (pl.LengthSq() < 1e-10f) pl = tw.GetNormalizedPerpendicular();
+		pl = pl.Normalized();
+		st.mTwistAxis1 = st.mTwistAxis2 = tw;
+		st.mPlaneAxis1 = st.mPlaneAxis2 = pl;
+		st.mPlaneHalfConeAngle  = d.swing1;
+		st.mNormalHalfConeAngle = d.swing2;
+		st.mTwistMinAngle = d.twistMin;
+		st.mTwistMaxAngle = d.twistMax;
+		JPH::SwingTwistConstraint* c =
+			static_cast<JPH::SwingTwistConstraint*>(st.Create(*a, *b));
+		m_system->AddConstraint(c);
+		const uint64_t id = m_nextJoint++;
+		m_joints[id] = c;
+		return id;
+	}
+
+	void destroyJoint(uint64_t joint) override
+	{
+		auto it = m_joints.find(joint);
+		if (it == m_joints.end() || !m_system) return;
+		m_system->RemoveConstraint(it->second);
+		m_joints.erase(it);
+	}
+
+	void setJointMotor(uint64_t joint, bool enabled, float frequency, float damping) override
+	{
+		auto it = m_joints.find(joint);
+		if (it == m_joints.end()) return;
+		JPH::SwingTwistConstraint* c = it->second;
+		const JPH::EMotorState s = enabled ? JPH::EMotorState::Position : JPH::EMotorState::Off;
+		JPH::MotorSettings& sm = c->GetSwingMotorSettings();
+		JPH::MotorSettings& tm = c->GetTwistMotorSettings();
+		sm.mSpringSettings.mFrequency = frequency;
+		sm.mSpringSettings.mDamping = damping;
+		tm.mSpringSettings.mFrequency = frequency;
+		tm.mSpringSettings.mDamping = damping;
+		c->SetSwingMotorState(s);
+		c->SetTwistMotorState(s);
+	}
+
+	void setJointTarget(uint64_t joint, const float q[4]) override
+	{
+		auto it = m_joints.find(joint);
+		if (it == m_joints.end()) return;
+		it->second->SetTargetOrientationBS(JPH::Quat(q[0], q[1], q[2], q[3]).Normalized());
+	}
+
 	void step(float dt) override
 	{
 		if (!m_system) return;
@@ -790,6 +856,8 @@ private:
 	std::map<uint64_t, CharRec>                m_characters;
 	uint64_t                                   m_nextCharId = 1;
 	JPH::CharacterVsCharacterCollisionSimple   m_charVsChar;  // characters collide with each other
+	std::map<uint64_t, JPH::SwingTwistConstraint*> m_joints;  // ragdoll joints (Ref held by the system)
+	uint64_t                                   m_nextJoint = 1;
 };
 static JoltPhysics gPhysics;
 
