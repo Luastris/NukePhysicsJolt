@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(NukePhysicsJolt CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/cmake/NukeRunDir.cmake")   # NUKE_RUN_SUBDIR: x64 / macos / linux
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -21,6 +23,9 @@ set(ENABLE_ALL_WARNINGS     OFF CACHE BOOL "" FORCE)
 set(INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "" FORCE)
 # Jolt defaults to the STATIC MSVC runtime — the whole toolchain here is /MDd (dynamic).
 set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+# The module derives from JPH::JobSystemWithBarrier and compiles WITH RTTI: Jolt must emit
+# the base's typeinfo (clang links it from the lib; MSVC emits it per-TU, hiding the issue).
+set(CPP_RTTI_ENABLED ON CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/deps/JoltPhysics/Build Jolt)
 
 add_library(NukePhysicsJolt SHARED
@@ -31,10 +36,20 @@ add_library(NukePhysicsJolt SHARED
 # NukeEngine.lib here is the IMPORT library of NukeEngine.dll (no static linking), used
 # for engine API such as nuke::Jobs (solver runs on the shared worker pool, 2.4).
 target_compile_definitions(NukePhysicsJolt PRIVATE
-    WIN32 _WINDOWS NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS
+    _USE_MATH_DEFINES
     GLM_ENABLE_EXPERIMENTAL
-    BOOST_ALL_DYN_LINK
 )
+if(WIN32)
+    target_compile_definitions(NukePhysicsJolt PRIVATE
+        WIN32 _WINDOWS NOMINMAX _CRT_SECURE_NO_WARNINGS
+        BOOST_ALL_DYN_LINK
+    )
+else()
+    target_compile_options(NukePhysicsJolt PRIVATE -Wno-c++11-narrowing -Wno-unknown-attributes)
+    set_target_properties(NukePhysicsJolt PROPERTIES
+        PREFIX ""
+        BUILD_RPATH "@loader_path/..;$ORIGIN/..")
+endif()
 
 target_include_directories(NukePhysicsJolt PRIVATE
     ${NUKE_ROOT}/NukeEngine
@@ -46,7 +61,7 @@ target_include_directories(NukePhysicsJolt PRIVATE
 
 target_link_directories(NukePhysicsJolt PRIVATE
     ${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>lib   # boost auto-link (header chain)
-    ${NUKE_ROOT}/NukeEngine/x64/$<CONFIG>             # NukeEngine.dll import lib
+    ${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>             # NukeEngine.dll import lib
 )
 
 target_link_libraries(NukePhysicsJolt PRIVATE
@@ -55,7 +70,7 @@ target_link_libraries(NukePhysicsJolt PRIVATE
 )
 
 # Deploy the plugin DLL into the editor's modules/ folder.
-set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/x64/$<CONFIG>/modules")
+set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>/modules")
 add_custom_command(TARGET NukePhysicsJolt POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -48,6 +48,17 @@
 
 using std::cout;
 using std::endl;
+
+// Jolt trace hook: a REAL variadic function — MSVC converts a (const char*, ...) lambda to
+// this pointer type, clang does not.
+static void JoltTrace(const char* fmt, ...)
+{
+	char buf[1024];
+	va_list args; va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	cout << "[Jolt]\t\t" << buf << endl;
+}
 using namespace nuke;
 
 // ---- Jolt collision layers: static world vs everything that moves ----
@@ -223,14 +234,7 @@ public:
 
 		// These hooks are REQUIRED: without them a Debug assert hits JPH_BREAKPOINT and kills
 		// the process silently.
-		JPH::Trace = [](const char* fmt, ...)
-		{
-			char buf[1024];
-			va_list args; va_start(args, fmt);
-			vsnprintf(buf, sizeof(buf), fmt, args);
-			va_end(args);
-			cout << "[Jolt]\t\t" << buf << endl;
-		};
+		JPH::Trace = &JoltTrace;   // real function: clang cannot convert a lambda to a variadic fn ptr
 		JPH_IF_ENABLE_ASSERTS(JPH::AssertFailed = [](const char* expr, const char* msg,
 		                                             const char* file, JPH::uint line) -> bool
 		{
