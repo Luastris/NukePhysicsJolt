@@ -26,6 +26,9 @@ set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
 # The module derives from JPH::JobSystemWithBarrier and compiles WITH RTTI: Jolt must emit
 # the base's typeinfo (clang links it from the lib; MSVC emits it per-TU, hiding the issue).
 set(CPP_RTTI_ENABLED ON CACHE BOOL "" FORCE)
+# Static Jolt links INTO this shared module: ELF requires the archive itself be PIC
+# (macOS/Windows are PIC/PIC-irrelevant by default and never notice).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/deps/JoltPhysics/Build Jolt)
 
 add_library(NukePhysicsJolt SHARED
