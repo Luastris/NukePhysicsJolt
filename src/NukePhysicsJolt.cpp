@@ -28,7 +28,12 @@
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
+#include <Jolt/Physics/Constraints/HingeConstraint.h>
+#include <Jolt/Physics/Constraints/SliderConstraint.h>
+#include <Jolt/Physics/Constraints/DistanceConstraint.h>
+#include <Jolt/Physics/Constraints/ConeConstraint.h>
 #include <Jolt/Physics/Body/BodyLockMulti.h>
+#include <Jolt/Core/StreamWrapper.h>
 
 // Engine headers last (they do `using namespace std;` internally).
 #include <interface/NUKEEInteface.h>   // NUKEModule (unified plugin model)
@@ -37,8 +42,10 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -269,6 +276,11 @@ public:
 		for (auto& kv : m_characters)
 			m_charVsChar.Remove(kv.second.character);
 		m_characters.clear();
+		// Constraints must leave the system before their bodies (stale body refs assert in step).
+		for (auto& kv : m_joints) m_system->RemoveConstraint(kv.second);
+		m_joints.clear();
+		for (auto& kv : m_constraints) m_system->RemoveConstraint(kv.second.first);
+		m_constraints.clear();
 		JPH::BodyInterface& bi = m_system->GetBodyInterface();
 		for (JPH::uint32 raw : m_bodies)
 		{
@@ -492,7 +504,7 @@ public:
 		m_system->GetBodyInterface().AddImpulse(JPH::BodyID((JPH::uint32)handle), JPH::Vec3(i[0], i[1], i[2]));
 	}
 
-	void addForceAtPoint(uint64_t handle, const float f[3], const float p[3]) override
+и	void addForceAtPoint(uint64_t handle, const float f[3], const float p[3]) override
 	{
 		if (!m_system || !handle) return;
 		m_system->GetBodyInterface().AddForce(JPH::BodyID((JPH::uint32)handle),
@@ -543,10 +555,20 @@ public:
 
 	void destroyJoint(uint64_t joint) override
 	{
+		if (!m_system) return;
 		auto it = m_joints.find(joint);
-		if (it == m_joints.end() || !m_system) return;
-		m_system->RemoveConstraint(it->second);
-		m_joints.erase(it);
+		if (it != m_joints.end())
+		{
+			m_system->RemoveConstraint(it->second);
+			m_joints.erase(it);
+			return;
+		}
+		auto ic = m_constraints.find(joint);
+		if (ic != m_constraints.end())
+		{
+			m_system->RemoveConstraint(ic->second.first);
+			m_constraints.erase(ic);
+		}
 	}
 
 	void setJointMotor(uint64_t joint, bool enabled, float frequency, float damping) override
@@ -570,6 +592,232 @@ public:
 		auto it = m_joints.find(joint);
 		if (it == m_joints.end()) return;
 		it->second->SetTargetOrientationBS(JPH::Quat(q[0], q[1], q[2], q[3]).Normalized());
+	}
+
+	// ---- generic constraints: appended at the iPhysics vtable END (ABI) ----
+
+	uint64_t createConstraint(const NukeConstraintDesc& d) override
+	{
+		if (!m_system || !d.bodyB) return 0;
+		const JPH::BodyID idA((JPH::uint32)d.bodyA);
+		const JPH::BodyID idB((JPH::uint32)d.bodyB);
+		JPH::Constraint* c = nullptr;
+		if (d.bodyA)
+		{
+			// Never MultiWrite-lock a duplicated id — same-mutex relock is undefined.
+			const JPH::BodyID ids[2] = { idA, idB };
+			JPH::BodyLockMultiWrite lock(m_system->GetBodyLockInterface(), ids, 2);
+			JPH::Body* a = lock.GetBody(0);
+			JPH::Body* b = lock.GetBody(1);
+			if (!a || !b) return 0;
+			c = BuildConstraint(d, *a, *b);
+		}
+		else
+		{
+			JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), idB);
+			if (!lock.Succeeded()) return 0;
+			c = BuildConstraint(d, JPH::Body::sFixedToWorld, lock.GetBody());
+		}
+		if (!c) return 0;
+		m_system->AddConstraint(c);
+		// A constraint changes the equilibrium — wake what it grabs (a sleeping body would
+		// hang mid-air until something else touches it).
+		JPH::BodyInterface& bi = m_system->GetBodyInterface();
+		bi.ActivateBody(idB);
+		if (d.bodyA) bi.ActivateBody(idA);
+		const uint64_t id = m_nextJoint++;
+		m_constraints[id] = { static_cast<JPH::TwoBodyConstraint*>(c), d.type };
+		return id;
+	}
+
+	static JPH::Constraint* BuildConstraint(const NukeConstraintDesc& d, JPH::Body& a, JPH::Body& b)
+	{
+		const JPH::RVec3 pivot(d.pivot[0], d.pivot[1], d.pivot[2]);
+		const JPH::RVec3 pivotB(d.pivotB[0], d.pivotB[1], d.pivotB[2]);
+		JPH::Vec3 axis(d.axis[0], d.axis[1], d.axis[2]);
+		if (axis.LengthSq() < 1e-10f) axis = JPH::Vec3::sAxisZ();
+		axis = axis.Normalized();
+		JPH::Vec3 nrm(d.normal[0], d.normal[1], d.normal[2]);
+		nrm -= axis * nrm.Dot(axis);   // enforce perpendicularity
+		if (nrm.LengthSq() < 1e-10f) nrm = axis.GetNormalizedPerpendicular();
+		nrm = nrm.Normalized();
+		JPH::Constraint* c = nullptr;
+		switch (d.type)
+		{
+			case 0:
+			{
+				JPH::HingeConstraintSettings s;
+				s.mSpace = JPH::EConstraintSpace::WorldSpace;
+				s.mPoint1 = s.mPoint2 = pivot;
+				s.mHingeAxis1 = s.mHingeAxis2 = axis;
+				s.mNormalAxis1 = s.mNormalAxis2 = nrm;
+				if (d.limit) { s.mLimitsMin = d.min; s.mLimitsMax = d.max; }
+				c = s.Create(a, b);
+				break;
+			}
+			case 1:
+			{
+				JPH::SliderConstraintSettings s;
+				s.mSpace = JPH::EConstraintSpace::WorldSpace;
+				s.mPoint1 = s.mPoint2 = pivot;
+				s.mSliderAxis1 = s.mSliderAxis2 = axis;
+				s.mNormalAxis1 = s.mNormalAxis2 = nrm;
+				if (d.limit) { s.mLimitsMin = d.min; s.mLimitsMax = d.max; }
+				c = s.Create(a, b);
+				break;
+			}
+			case 2:
+			case 3:
+			{
+				JPH::DistanceConstraintSettings s;
+				s.mSpace = JPH::EConstraintSpace::WorldSpace;
+				s.mPoint1 = pivot;
+				s.mPoint2 = pivotB;
+				if (d.limit) { s.mMinDistance = d.min; s.mMaxDistance = d.max; }
+				if (d.frequency > 0.0f)
+					s.mLimitsSpringSettings = JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping,
+					                                              d.frequency, d.damping);
+				c = s.Create(a, b);
+				break;
+			}
+			case 4:
+			{
+				JPH::ConeConstraintSettings s;
+				s.mSpace = JPH::EConstraintSpace::WorldSpace;
+				s.mPoint1 = s.mPoint2 = pivot;
+				s.mTwistAxis1 = s.mTwistAxis2 = axis;
+				s.mHalfConeAngle = d.halfCone;
+				c = s.Create(a, b);
+				break;
+			}
+		}
+		return c;
+	}
+
+	void setConstraintMotor(uint64_t cid, int mode, float target, float maxForce) override
+	{
+		auto it = m_constraints.find(cid);
+		if (it == m_constraints.end()) return;
+		const JPH::EMotorState st = mode == 1 ? JPH::EMotorState::Velocity
+		                          : mode == 2 ? JPH::EMotorState::Position
+		                                      : JPH::EMotorState::Off;
+		if (it->second.second == 0)
+		{
+			auto* h = static_cast<JPH::HingeConstraint*>(it->second.first);
+			JPH::MotorSettings& ms = h->GetMotorSettings();
+			if (maxForce > 0.0f) { ms.mMinTorqueLimit = -maxForce; ms.mMaxTorqueLimit = maxForce; }
+			h->SetMotorState(st);
+			if (mode == 1) h->SetTargetAngularVelocity(target);
+			else if (mode == 2) h->SetTargetAngle(target);
+		}
+		else if (it->second.second == 1)
+		{
+			auto* s = static_cast<JPH::SliderConstraint*>(it->second.first);
+			JPH::MotorSettings& ms = s->GetMotorSettings();
+			if (maxForce > 0.0f) { ms.mMinForceLimit = -maxForce; ms.mMaxForceLimit = maxForce; }
+			s->SetMotorState(st);
+			if (mode == 1) s->SetTargetVelocity(target);
+			else if (mode == 2) s->SetTargetPosition(target);
+		}
+		else
+			return;
+		// A sleeping body ignores its motor until something wakes it.
+		if (JPH::Body* b2 = it->second.first->GetBody2())
+			m_system->GetBodyInterface().ActivateBody(b2->GetID());
+	}
+
+	float constraintImpulse(uint64_t cid) override
+	{
+		auto it = m_constraints.find(cid);
+		if (it == m_constraints.end()) return 0.0f;
+		JPH::TwoBodyConstraint* c = it->second.first;
+		switch (it->second.second)
+		{
+			case 0: return static_cast<JPH::HingeConstraint*>(c)->GetTotalLambdaPosition().Length();
+			case 1:
+			{
+				const auto l = static_cast<JPH::SliderConstraint*>(c)->GetTotalLambdaPosition();
+				return std::sqrt(l[0] * l[0] + l[1] * l[1]);
+			}
+			case 2:
+			case 3: return std::fabs(static_cast<JPH::DistanceConstraint*>(c)->GetTotalLambdaPosition());
+			case 4: return static_cast<JPH::ConeConstraint*>(c)->GetTotalLambdaPosition().Length();
+		}
+		return 0.0f;
+	}
+
+	// ---- serialized shapes: appended at the iPhysics vtable END (ABI) ----
+
+	bool cookMeshShape(const float* verts, int vertCount, void** outBlob, int* outSize) override
+	{
+		if (!verts || vertCount < 3 || !outBlob || !outSize) return false;
+		JPH::TriangleList tris;
+		const int triCount = vertCount / 3;
+		tris.reserve(triCount);
+		for (int t = 0; t < triCount; ++t)
+		{
+			const float* v = verts + t * 9;
+			tris.push_back(JPH::Triangle(JPH::Float3(v[0], v[1], v[2]),
+			                             JPH::Float3(v[3], v[4], v[5]),
+			                             JPH::Float3(v[6], v[7], v[8])));
+		}
+		JPH::MeshShapeSettings ms(tris);
+		JPH::Shape::ShapeResult r = ms.Create();
+		if (r.HasError())
+		{
+			cout << "[NukePhysicsJolt]\tcookMeshShape failed: " << r.GetError() << endl;
+			return false;
+		}
+		std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+		JPH::StreamOutWrapper out(ss);
+		r.Get()->SaveBinaryState(out);
+		const std::string s = ss.str();
+		if (s.empty()) return false;
+		char* blob = (char*)std::malloc(s.size());
+		if (!blob) return false;
+		std::memcpy(blob, s.data(), s.size());
+		*outBlob = blob;
+		*outSize = (int)s.size();
+		return true;
+	}
+
+	void freeCookedBlob(void* blob) override { std::free(blob); }
+
+	uint64_t createBodyFromCooked(const void* blob, int size, const float pos[3],
+	                              const float quat[4], float friction, float restitution) override
+	{
+		if (!m_system || !blob || size <= 0) return 0;
+		std::stringstream ss(std::string((const char*)blob, (size_t)size),
+		                     std::ios::in | std::ios::binary);
+		JPH::StreamInWrapper in(ss);
+		JPH::Shape::ShapeResult r = JPH::Shape::sRestoreFromBinaryState(in);
+		if (r.HasError())
+		{
+			// Stale blob (Jolt upgrade / backend change): the caller re-cooks from source.
+			cout << "[NukePhysicsJolt]\tcooked shape restore failed: " << r.GetError() << endl;
+			return 0;
+		}
+		JPH::BodyCreationSettings bcs(r.Get(),
+			JPH::RVec3(pos[0], pos[1], pos[2]),
+			JPH::Quat(quat[0], quat[1], quat[2], quat[3]).Normalized(),
+			JPH::EMotionType::Static, ObjLayers::NON_MOVING);
+		bcs.mFriction    = friction;
+		bcs.mRestitution = restitution;
+		JPH::BodyInterface& bi = m_system->GetBodyInterface();
+		JPH::Body* body = bi.CreateBody(bcs);
+		if (!body) { cout << "[NukePhysicsJolt]\tcreateBodyFromCooked FAILED (body pool full?)" << endl; return 0; }
+		bi.AddBody(body->GetID(), JPH::EActivation::Activate);
+		m_bodies.insert(body->GetID().GetIndexAndSequenceNumber());
+		return body->GetID().GetIndexAndSequenceNumber();
+	}
+
+	void activateBodies(const float mn[3], const float mx[3]) override
+	{
+		if (!m_system) return;
+		const JPH::AABox box(JPH::Vec3(mn[0], mn[1], mn[2]), JPH::Vec3(mx[0], mx[1], mx[2]));
+		JPH::BroadPhaseLayerFilter bp;
+		JPH::ObjectLayerFilter ol;
+		m_system->GetBodyInterface().ActivateBodiesInAABox(box, bp, ol);
 	}
 
 	void step(float dt) override
@@ -861,6 +1109,8 @@ private:
 	uint64_t                                   m_nextCharId = 1;
 	JPH::CharacterVsCharacterCollisionSimple   m_charVsChar;  // characters collide with each other
 	std::map<uint64_t, JPH::SwingTwistConstraint*> m_joints;  // ragdoll joints (Ref held by the system)
+	// Generic constraints (createConstraint): the Jolt constraint + its NukeConstraintDesc type.
+	std::map<uint64_t, std::pair<JPH::TwoBodyConstraint*, int>> m_constraints;
 	uint64_t                                   m_nextJoint = 1;
 };
 static JoltPhysics gPhysics;
