@@ -32,6 +32,10 @@
 #include <Jolt/Physics/Constraints/SliderConstraint.h>
 #include <Jolt/Physics/Constraints/DistanceConstraint.h>
 #include <Jolt/Physics/Constraints/ConeConstraint.h>
+#include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
+#include <Jolt/Physics/Vehicle/VehicleConstraint.h>
+#include <Jolt/Physics/Vehicle/WheeledVehicleController.h>
+#include <Jolt/Physics/Vehicle/VehicleCollisionTester.h>
 #include <Jolt/Physics/Body/BodyLockMulti.h>
 #include <Jolt/Core/StreamWrapper.h>
 
@@ -277,6 +281,12 @@ public:
 			m_charVsChar.Remove(kv.second.character);
 		m_characters.clear();
 		// Constraints must leave the system before their bodies (stale body refs assert in step).
+		for (auto& kv : m_vehicles)
+		{
+			m_system->RemoveStepListener(kv.second);
+			m_system->RemoveConstraint(kv.second);
+		}
+		m_vehicles.clear();
 		for (auto& kv : m_joints) m_system->RemoveConstraint(kv.second);
 		m_joints.clear();
 		for (auto& kv : m_constraints) m_system->RemoveConstraint(kv.second.first);
@@ -361,6 +371,15 @@ public:
 			default:
 				shape = MakePrimitiveShape(0, d.halfExtents, d.radius, d.halfHeight);
 				break;
+		}
+
+		// Center-of-mass shift (vehicles/boats): wrap the shape, geometry stays put.
+		if (d.comOffset[0] != 0.0f || d.comOffset[1] != 0.0f || d.comOffset[2] != 0.0f)
+		{
+			JPH::OffsetCenterOfMassShapeSettings os(
+				JPH::Vec3(d.comOffset[0], d.comOffset[1], d.comOffset[2]), shape);
+			JPH::Shape::ShapeResult r = os.Create();
+			if (!r.HasError()) shape = r.Get();
 		}
 
 		const JPH::EMotionType motion = motionCode == 1 ? JPH::EMotionType::Dynamic
@@ -504,7 +523,7 @@ public:
 		m_system->GetBodyInterface().AddImpulse(JPH::BodyID((JPH::uint32)handle), JPH::Vec3(i[0], i[1], i[2]));
 	}
 
-и	void addForceAtPoint(uint64_t handle, const float f[3], const float p[3]) override
+	void addForceAtPoint(uint64_t handle, const float f[3], const float p[3]) override
 	{
 		if (!m_system || !handle) return;
 		m_system->GetBodyInterface().AddForce(JPH::BodyID((JPH::uint32)handle),
@@ -744,6 +763,128 @@ public:
 			case 4: return static_cast<JPH::ConeConstraint*>(c)->GetTotalLambdaPosition().Length();
 		}
 		return 0.0f;
+	}
+
+	// ---- wheeled vehicles: appended at the iPhysics vtable END (ABI) ----
+
+	uint64_t createVehicle(const NukeVehicleDesc& d) override
+	{
+		if (!m_system || !d.chassis || !d.wheels || d.wheelCount < 1) return 0;
+		JPH::Ref<JPH::VehicleConstraint> vc;
+		{
+			JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID((JPH::uint32)d.chassis));
+			if (!lock.Succeeded()) return 0;
+			JPH::VehicleConstraintSettings vs;
+			auto* controller = new JPH::WheeledVehicleControllerSettings();
+			controller->mEngine.mMaxTorque = d.maxTorque;
+			controller->mEngine.mMaxRPM = d.maxRPM;
+			int prevDriven = -1;
+			for (int i = 0; i < d.wheelCount; ++i)
+			{
+				const NukeWheelDesc& w = d.wheels[i];
+				auto* ws = new JPH::WheelSettingsWV();
+				ws->mPosition = JPH::Vec3(w.pos[0], w.pos[1], w.pos[2]);
+				ws->mRadius = w.radius;
+				ws->mWidth = w.width;
+				ws->mSuspensionMinLength = w.suspensionMin;
+				ws->mSuspensionMaxLength = std::max(w.suspensionMax, w.suspensionMin + 0.01f);
+				ws->mSuspensionSpring = JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping,
+				                                            w.frequency, w.damping);
+				ws->mMaxSteerAngle = w.maxSteerDeg * 0.01745329252f;
+				ws->mMaxBrakeTorque = w.maxBrakeTorque;
+				ws->mMaxHandBrakeTorque = w.maxHandBrakeTorque;
+				vs.mWheels.push_back(ws);
+				if (w.driven)
+				{
+					// Driven wheels pair into differentials in declaration order.
+					if (prevDriven < 0) prevDriven = i;
+					else
+					{
+						JPH::VehicleDifferentialSettings ds;
+						ds.mLeftWheel = prevDriven;
+						ds.mRightWheel = i;
+						controller->mDifferentials.push_back(ds);
+						prevDriven = -1;
+					}
+				}
+			}
+			if (prevDriven >= 0)   // odd driven wheel drives alone
+			{
+				JPH::VehicleDifferentialSettings ds;
+				ds.mLeftWheel = prevDriven;
+				ds.mRightWheel = -1;
+				controller->mDifferentials.push_back(ds);
+			}
+			if (!controller->mDifferentials.empty())
+				for (JPH::VehicleDifferentialSettings& ds : controller->mDifferentials)
+					ds.mEngineTorqueRatio = 1.0f / controller->mDifferentials.size();
+			vs.mController = controller;
+			vc = new JPH::VehicleConstraint(lock.GetBody(), vs);
+			vc->SetVehicleCollisionTester(new JPH::VehicleCollisionTesterCastCylinder(ObjLayers::MOVING));
+		}
+		m_system->AddConstraint(vc);
+		m_system->AddStepListener(vc);
+		m_system->GetBodyInterface().ActivateBody(JPH::BodyID((JPH::uint32)d.chassis));
+		const uint64_t id = m_nextJoint++;
+		m_vehicles[id] = vc;
+		return id;
+	}
+
+	void destroyVehicle(uint64_t v) override
+	{
+		auto it = m_vehicles.find(v);
+		if (it == m_vehicles.end() || !m_system) return;
+		m_system->RemoveStepListener(it->second);
+		m_system->RemoveConstraint(it->second);
+		m_vehicles.erase(it);
+	}
+
+	void setVehicleInput(uint64_t v, float forward, float right, float brake, float handBrake) override
+	{
+		auto it = m_vehicles.find(v);
+		if (it == m_vehicles.end()) return;
+		auto* c = static_cast<JPH::WheeledVehicleController*>(it->second->GetController());
+		c->SetDriverInput(forward, right, brake, handBrake);
+		if (std::fabs(forward) > 0.01f || std::fabs(right) > 0.01f || brake > 0.01f || handBrake > 0.01f)
+			m_system->GetBodyInterface().ActivateBody(it->second->GetVehicleBody()->GetID());
+	}
+
+	bool getWheelState(uint64_t v, int wheel, NukeWheelState& out) override
+	{
+		auto it = m_vehicles.find(v);
+		if (it == m_vehicles.end()) return false;
+		JPH::VehicleConstraint* c = it->second;
+		if (wheel < 0 || wheel >= (int)c->GetWheels().size()) return false;
+		const JPH::RMat44 m = c->GetWheelWorldTransform((JPH::uint)wheel, JPH::Vec3::sAxisY(), JPH::Vec3::sAxisX());
+		const JPH::RVec3 p = m.GetTranslation();
+		const JPH::Quat q = m.GetQuaternion().Normalized();
+		out.pos[0] = (float)p.GetX(); out.pos[1] = (float)p.GetY(); out.pos[2] = (float)p.GetZ();
+		out.quat[0] = q.GetX(); out.quat[1] = q.GetY(); out.quat[2] = q.GetZ(); out.quat[3] = q.GetW();
+		const JPH::Wheel* w = c->GetWheel((JPH::uint)wheel);
+		out.suspension = w->GetSuspensionLength();
+		out.contact = w->HasContact() ? 1 : 0;
+		const auto* wv = static_cast<const JPH::WheelWV*>(w);
+		out.longSlip = wv->mLongitudinalSlip;
+		out.latSlip = wv->mLateralSlip;
+		return true;
+	}
+
+	float vehicleRPM(uint64_t v) override
+	{
+		auto it = m_vehicles.find(v);
+		if (it == m_vehicles.end()) return 0.0f;
+		return static_cast<JPH::WheeledVehicleController*>(it->second->GetController())->GetEngine().GetCurrentRPM();
+	}
+
+	float vehicleSpeed(uint64_t v) override
+	{
+		auto it = m_vehicles.find(v);
+		if (it == m_vehicles.end()) return 0.0f;
+		JPH::Body* b = it->second->GetVehicleBody();
+		JPH::BodyLockRead lock(m_system->GetBodyLockInterface(), b->GetID());
+		if (!lock.Succeeded()) return 0.0f;
+		const JPH::Body& body = lock.GetBody();
+		return body.GetRotation().RotateAxisZ().Dot(body.GetLinearVelocity());
 	}
 
 	// ---- serialized shapes: appended at the iPhysics vtable END (ABI) ----
@@ -1111,6 +1252,8 @@ private:
 	std::map<uint64_t, JPH::SwingTwistConstraint*> m_joints;  // ragdoll joints (Ref held by the system)
 	// Generic constraints (createConstraint): the Jolt constraint + its NukeConstraintDesc type.
 	std::map<uint64_t, std::pair<JPH::TwoBodyConstraint*, int>> m_constraints;
+	// Wheeled vehicles: the constraint doubles as the step listener; the Ref keeps it alive.
+	std::map<uint64_t, JPH::Ref<JPH::VehicleConstraint>> m_vehicles;
 	uint64_t                                   m_nextJoint = 1;
 };
 static JoltPhysics gPhysics;
