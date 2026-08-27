@@ -887,6 +887,26 @@ public:
 		return body.GetRotation().RotateAxisZ().Dot(body.GetLinearVelocity());
 	}
 
+	bool sphereCastDist(float radius, const float from[3], const float dir[3],
+	                    float maxDist, uint64_t ignoreBody, float& outDist) override
+	{
+		if (!m_system || maxDist <= 0.0f) return false;
+		JPH::Vec3 d(dir[0], dir[1], dir[2]);
+		if (d.LengthSq() < 1e-12f) return false;
+		d = d.Normalized() * maxDist;
+		JPH::RefConst<JPH::Shape> shape = new JPH::SphereShape(std::max(1e-4f, radius));
+		JPH::RShapeCast cast(shape, JPH::Vec3::sReplicate(1.0f),
+		                     JPH::RMat44::sTranslation(JPH::RVec3(from[0], from[1], from[2])), d);
+		JPH::ShapeCastSettings settings;
+		JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> collector;
+		JPH::IgnoreSingleBodyFilter ignore{ JPH::BodyID((JPH::uint32)ignoreBody) };
+		m_system->GetNarrowPhaseQuery().CastShape(cast, settings, JPH::RVec3::sZero(), collector,
+		                                          {}, {}, ignore);
+		if (!collector.HadHit()) return false;
+		outDist = collector.mHit.mFraction * maxDist;
+		return true;
+	}
+
 	// ---- serialized shapes: appended at the iPhysics vtable END (ABI) ----
 
 	bool cookMeshShape(const float* verts, int vertCount, void** outBlob, int* outSize) override
