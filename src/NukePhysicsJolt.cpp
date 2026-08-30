@@ -907,6 +907,22 @@ public:
 		return true;
 	}
 
+	// ---- isolated scenes: appended at the iPhysics vtable END (ABI 35) ----
+	// Each JoltPhysics instance is a self-contained scene (own PhysicsSystem/JobSystem/
+	// TempAllocator); the Jolt process-globals (allocator, Factory, Trace) are guarded
+	// once in init(). Deleting a scene must NOT run shutdown() — that tears down the
+	// global Factory under every other scene.
+
+	iPhysics* createScene() override { return new JoltPhysics(); }
+
+	void destroyScene(iPhysics* s) override
+	{
+		if (!s || s == this) return;   // never the service's own main scene
+		JoltPhysics* jp = static_cast<JoltPhysics*>(s);
+		jp->reset();                   // drop bodies/characters/joints while the system lives
+		delete jp;
+	}
+
 	// ---- serialized shapes: appended at the iPhysics vtable END (ABI) ----
 
 	bool cookMeshShape(const float* verts, int vertCount, void** outBlob, int* outSize) override
