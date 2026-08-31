@@ -29,7 +29,26 @@ set(CPP_RTTI_ENABLED ON CACHE BOOL "" FORCE)
 # Static Jolt links INTO this shared module: ELF requires the archive itself be PIC
 # (macOS/Windows are PIC/PIC-irrelevant by default and never notice).
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Jolt itself builds OPTIMIZED even in Debug (same /MDd CRT, so no mixed-CRT hazard):
+# an unoptimized Jolt runs soft-body/ragdoll scenes at ~15 Hz fixed steps — vertices
+# travel farther per step than their collision radius (cloth tunnels into boxes, skinned
+# constraints jump) and the whole sim degrades. The MODULE's own code stays a normal
+# Debug build; only the vendored solver gets /O2 (RTC checks are incompatible with /O2
+# and are dropped for Jolt's TUs only).
+if(MSVC)
+    # Jolt's own CMake OVERRIDES CMAKE_CXX_FLAGS_DEBUG back to "/Od /RTC1" unless told not
+    # to (OVERRIDE_CXX_FLAGS, default ON) — without this the /O2 below silently never lands
+    # and a Debug solver runs soft-body scenes at slideshow rates.
+    set(OVERRIDE_CXX_FLAGS OFF CACHE BOOL "" FORCE)
+    set(_nuke_saved_dbg_flags "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/RTC1" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/Od" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /O2 /Ob2")
+endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/deps/JoltPhysics/Build Jolt)
+if(MSVC)
+    set(CMAKE_CXX_FLAGS_DEBUG "${_nuke_saved_dbg_flags}")
+endif()
 
 add_library(NukePhysicsJolt SHARED
     src/NukePhysicsJolt.cpp

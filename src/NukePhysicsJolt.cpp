@@ -38,12 +38,18 @@
 #include <Jolt/Physics/Vehicle/VehicleCollisionTester.h>
 #include <Jolt/Physics/Body/BodyLockMulti.h>
 #include <Jolt/Core/StreamWrapper.h>
+#include <Jolt/Physics/SoftBody/SoftBodyCreationSettings.h>
+#include <Jolt/Physics/SoftBody/SoftBodySharedSettings.h>
+#include <Jolt/Physics/SoftBody/SoftBodyMotionProperties.h>
 
 // Engine headers last (they do `using namespace std;` internally).
 #include <interface/NUKEEInteface.h>   // NUKEModule (unified plugin model)
 #include <service/iPhysics.h>          // the contract this module provides
 #include <API/Model/Jobs.h>            // engine worker pool
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -77,7 +83,10 @@ namespace ObjLayers   // Jolt OBJECT layers; nuke::Layers are the engine's RENDE
 {
 	static constexpr JPH::ObjectLayer NON_MOVING = 0;
 	static constexpr JPH::ObjectLayer MOVING     = 1;
-	static constexpr JPH::ObjectLayer NUM_LAYERS = 2;
+	static constexpr JPH::ObjectLayer SOFT       = 2;   // world-space soft bodies (flags, tablecloths)
+	static constexpr JPH::ObjectLayer SOFT_PROXY = 3;   // collides ONLY with soft cloth (body proxies)
+	static constexpr JPH::ObjectLayer SOFT_LOCAL = 4;   // anchor-space cloth: proxies ONLY, never the world
+	static constexpr JPH::ObjectLayer NUM_LAYERS = 5;
 }
 namespace BPLayers
 {
@@ -107,6 +116,9 @@ class ObjectVsBroadPhaseLayerFilterImpl final : public JPH::ObjectVsBroadPhaseLa
 public:
 	bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bpLayer) const override
 	{
+		// Cloth-only layers live in the MOVING broadphase and want nothing from NON_MOVING.
+		if (layer == ObjLayers::SOFT_PROXY || layer == ObjLayers::SOFT_LOCAL)
+			return bpLayer == BPLayers::MOVING;
 		return layer != ObjLayers::NON_MOVING || bpLayer != BPLayers::NON_MOVING;
 	}
 };
@@ -116,6 +128,12 @@ class ObjectLayerPairFilterImpl final : public JPH::ObjectLayerPairFilter
 public:
 	bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override
 	{
+		// Anchor-space cloth touches ONLY the body proxies (it sits near the origin, the
+		// world there is unrelated); proxies touch ONLY cloth.
+		if (a == ObjLayers::SOFT_LOCAL || b == ObjLayers::SOFT_LOCAL)
+			return (a == ObjLayers::SOFT_LOCAL ? b : a) == ObjLayers::SOFT_PROXY;
+		if (a == ObjLayers::SOFT_PROXY || b == ObjLayers::SOFT_PROXY)
+			return (a == ObjLayers::SOFT_PROXY ? b : a) == ObjLayers::SOFT;
 		return a != ObjLayers::NON_MOVING || b != ObjLayers::NON_MOVING;
 	}
 };
@@ -193,6 +211,15 @@ public:
 		m_jobs.Init(maxJobs, maxJobs);
 	}
 
+	// A pool worker's `job->Release()` runs AFTER the barrier lets step() return — destroying
+	// this system right then frees the job list under a live release (teardown assert at
+	// best, use-after-free at worst; scene destroys and Quit both hit it). Wait them out.
+	~NukeJobSystem() override
+	{
+		while (m_inFlight.load(std::memory_order_acquire) > 0)
+			std::this_thread::yield();
+	}
+
 	int GetMaxConcurrency() const override
 	{
 		return nuke::Jobs::WorkerCount() + 1;   // + the calling thread: it runs barrier jobs too
@@ -221,7 +248,13 @@ protected:
 	void QueueJob(Job* job) override
 	{
 		job->AddRef();                   // released after Execute
-		nuke::Jobs::Schedule([job] { job->Execute(); job->Release(); });
+		m_inFlight.fetch_add(1, std::memory_order_relaxed);
+		nuke::Jobs::Schedule([job, this]
+		{
+			job->Execute();
+			job->Release();
+			m_inFlight.fetch_sub(1, std::memory_order_release);
+		});
 	}
 	void QueueJobs(Job** jobs, JPH::uint count) override
 	{
@@ -233,6 +266,7 @@ protected:
 private:
 	using AvailableJobs = JPH::FixedSizeFreeList<Job>;
 	AvailableJobs m_jobs;
+	std::atomic<int> m_inFlight{ 0 };
 };
 
 // ---- iPhysics implementation ----
@@ -385,7 +419,8 @@ public:
 		const JPH::EMotionType motion = motionCode == 1 ? JPH::EMotionType::Dynamic
 		                              : motionCode == 2 ? JPH::EMotionType::Kinematic
 		                                                : JPH::EMotionType::Static;
-		const JPH::ObjectLayer layer = motionCode == 0 ? ObjLayers::NON_MOVING : ObjLayers::MOVING;
+		const JPH::ObjectLayer layer = d.softOnly    ? ObjLayers::SOFT_PROXY
+		                             : motionCode == 0 ? ObjLayers::NON_MOVING : ObjLayers::MOVING;
 
 		JPH::BodyCreationSettings bcs(shape,
 			JPH::RVec3(d.pos[0], d.pos[1], d.pos[2]),
@@ -920,7 +955,169 @@ public:
 		if (!s || s == this) return;   // never the service's own main scene
 		JoltPhysics* jp = static_cast<JoltPhysics*>(s);
 		jp->reset();                   // drop bodies/characters/joints while the system lives
+		if (jp->m_system) jp->step(1.0f / 60.0f);   // broad phase frees removed nodes lazily
 		delete jp;
+	}
+
+	// ---- soft-body cloth (C3): appended at the iPhysics vtable END (ABI 40) ----
+	// A soft body is a regular Jolt body (handle-compatible with destroyBody's sweep in
+	// reset()); rotation stays identity and mUpdatePosition is off, so the body-local <->
+	// world conversion is a fixed translation for the body's whole life.
+
+	uint64_t createSoftBody(const NukeSoftBodyDesc& d) override
+	{
+		if (!m_system || !d.verts || d.numVerts < 3 || !d.indices || d.numTris < 1) return 0;
+		using SBSS = JPH::SoftBodySharedSettings;
+		JPH::Ref<SBSS> ss = new SBSS();
+		ss->mVertices.reserve(d.numVerts);
+		for (int i = 0; i < d.numVerts; ++i)
+		{
+			SBSS::Vertex v;
+			v.mPosition = JPH::Float3(d.verts[i * 3 + 0] - d.pos[0],
+			                          d.verts[i * 3 + 1] - d.pos[1],
+			                          d.verts[i * 3 + 2] - d.pos[2]);
+			v.mInvMass = d.invMass ? d.invMass[i] : 1.0f;
+			ss->mVertices.push_back(v);
+		}
+		int faces = 0;
+		for (int t = 0; t < d.numTris; ++t)
+		{
+			SBSS::Face f(d.indices[t * 3 + 0], d.indices[t * 3 + 1], d.indices[t * 3 + 2]);
+			if (f.IsDegenerate()) continue;
+			ss->AddFace(f);
+			++faces;
+		}
+		if (faces == 0) return 0;
+		const SBSS::VertexAttributes attr(d.compliance, d.compliance, d.bendCompliance);
+		ss->CreateConstraints(&attr, 1, SBSS::EBendType::Dihedral);
+
+		// Skinned-constraint block (fitted clothes): the solver itself leashes every vertex
+		// to its skinned position with a face-normal backstop behind the surface.
+		if (d.invBind && d.numJoints > 0 && d.skinJoints && d.skinWeights)
+		{
+			ss->mInvBindMatrices.reserve(d.numJoints);
+			for (int j = 0; j < d.numJoints; ++j)
+				ss->mInvBindMatrices.push_back(SBSS::InvBind(
+					(JPH::uint32)j, JPH::Mat44::sLoadFloat4x4((const JPH::Float4*)(d.invBind + j * 16))));
+			ss->mSkinnedConstraints.reserve(d.numVerts);
+			for (int v = 0; v < d.numVerts; ++v)
+			{
+				const float maxDist = d.skinMaxDist ? d.skinMaxDist[v] : FLT_MAX;
+				SBSS::Skinned sk((JPH::uint32)v,
+				                 maxDist >= 1e9f ? FLT_MAX : maxDist,
+				                 d.backstopDistance >= 1e9f ? FLT_MAX : d.backstopDistance,
+				                 d.backstopRadius);
+				int w = 0;
+				for (int k = 0; k < 4 && w < (int)SBSS::Skinned::cMaxSkinWeights; ++k)
+				{
+					const float wt = d.skinWeights[v * 4 + k];
+					const int j = d.skinJoints[v * 4 + k];
+					if (wt <= 0.0f || j < 0 || j >= d.numJoints) continue;
+					sk.mWeights[w++] = SBSS::SkinWeight((JPH::uint32)j, wt);
+				}
+				if (w == 0) continue;
+				sk.NormalizeWeights();
+				ss->mSkinnedConstraints.push_back(sk);
+			}
+			ss->CalculateSkinnedConstraintNormals();
+		}
+		ss->Optimize();
+
+		JPH::SoftBodyCreationSettings cs(ss,
+			JPH::RVec3(d.pos[0], d.pos[1], d.pos[2]),
+			JPH::Quat::sIdentity(), d.localSpace ? ObjLayers::SOFT_LOCAL : ObjLayers::SOFT);
+		cs.mNumIterations  = d.iterations > 0 ? (JPH::uint32)d.iterations : 5;
+		cs.mLinearDamping  = d.linearDamping;
+		cs.mFriction       = d.friction;
+		cs.mPressure       = d.pressure;
+		cs.mGravityFactor  = d.gravityFactor;
+		cs.mVertexRadius   = d.vertexRadius;
+		cs.mUpdatePosition = false;    // stable origin: world = local + pos, forever
+		cs.mAllowSleeping  = false;    // pinned verts move by direct writes a sleeper ignores
+
+		JPH::BodyInterface& bi = m_system->GetBodyInterface();
+		JPH::Body* body = bi.CreateSoftBody(cs);
+		if (!body) { cout << "[NukePhysicsJolt]\tcreateSoftBody FAILED (body pool full?)" << endl; return 0; }
+		bi.AddBody(body->GetID(), JPH::EActivation::Activate);
+		m_bodies.insert(body->GetID().GetIndexAndSequenceNumber());   // reset() sweeps it too
+		return body->GetID().GetIndexAndSequenceNumber();
+	}
+
+	void destroySoftBody(uint64_t sb) override { destroyBody(sb); }
+
+	void setSoftBodyVertices(uint64_t sb, const int* idx, const float* worldPos, int n) override
+	{
+		if (!m_system || !sb || !idx || !worldPos || n <= 0) return;
+		JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID((JPH::uint32)sb));
+		if (!lock.Succeeded()) return;
+		JPH::Body& b = lock.GetBody();
+		if (!b.IsSoftBody()) return;
+		auto* mp = static_cast<JPH::SoftBodyMotionProperties*>(b.GetMotionProperties());
+		const JPH::RMat44 inv = b.GetCenterOfMassTransform().Inversed();
+		JPH::Array<JPH::SoftBodyVertex>& vs = mp->GetVertices();
+		for (int i = 0; i < n; ++i)
+		{
+			const int v = idx[i];
+			if (v < 0 || v >= (int)vs.size()) continue;
+			const JPH::Vec3 lp = JPH::Vec3(inv * JPH::RVec3(worldPos[i * 3 + 0],
+			                                                worldPos[i * 3 + 1],
+			                                                worldPos[i * 3 + 2]));
+			// Pins (invMass 0) are kinematic: their velocity is the drive, kill it. A FREE
+			// vertex here is a position CORRECTION (capsule push-out, max-distance leash) -
+			// keep its velocity or the sim freezes.
+			if (vs[v].mInvMass == 0.0f) vs[v].mVelocity = JPH::Vec3::sZero();
+			vs[v].mPosition = lp;
+		}
+	}
+
+	bool getSoftBodyVertices(uint64_t sb, float* out, int maxVerts) override
+	{
+		if (!m_system || !sb || !out || maxVerts <= 0) return false;
+		JPH::BodyLockRead lock(m_system->GetBodyLockInterface(), JPH::BodyID((JPH::uint32)sb));
+		if (!lock.Succeeded()) return false;
+		const JPH::Body& b = lock.GetBody();
+		if (!b.IsSoftBody()) return false;
+		const auto* mp = static_cast<const JPH::SoftBodyMotionProperties*>(b.GetMotionProperties());
+		const JPH::RMat44 com = b.GetCenterOfMassTransform();
+		const JPH::Array<JPH::SoftBodyVertex>& vs = mp->GetVertices();
+		const int n = std::min(maxVerts, (int)vs.size());
+		for (int i = 0; i < n; ++i)
+		{
+			const JPH::RVec3 w = com * vs[i].mPosition;
+			out[i * 3 + 0] = (float)w.GetX();
+			out[i * 3 + 1] = (float)w.GetY();
+			out[i * 3 + 2] = (float)w.GetZ();
+		}
+		return true;
+	}
+
+	void addSoftBodyVelocity(uint64_t sb, const float dv[3]) override
+	{
+		if (!m_system || !sb || !dv) return;
+		JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID((JPH::uint32)sb));
+		if (!lock.Succeeded()) return;
+		JPH::Body& b = lock.GetBody();
+		if (!b.IsSoftBody()) return;
+		auto* mp = static_cast<JPH::SoftBodyMotionProperties*>(b.GetMotionProperties());
+		const JPH::Vec3 d(dv[0], dv[1], dv[2]);
+		for (JPH::SoftBodyVertex& v : mp->GetVertices())
+			if (v.mInvMass > 0.0f) v.mVelocity += d;
+	}
+
+	void setSoftBodyJoints(uint64_t sb, const float* joints16, int numJoints, bool hardSkin) override
+	{
+		if (!m_system || !sb || !joints16 || numJoints <= 0 || !m_tempAllocator) return;
+		JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID((JPH::uint32)sb));
+		if (!lock.Succeeded()) return;
+		JPH::Body& b = lock.GetBody();
+		if (!b.IsSoftBody()) return;
+		auto* mp = static_cast<JPH::SoftBodyMotionProperties*>(b.GetMotionProperties());
+		JPH::Array<JPH::Mat44> mats;
+		mats.reserve(numJoints);
+		for (int j = 0; j < numJoints; ++j)
+			mats.push_back(JPH::Mat44::sLoadFloat4x4((const JPH::Float4*)(joints16 + j * 16)));
+		mp->SkinVertices(b.GetCenterOfMassTransform(), mats.data(), (JPH::uint)numJoints,
+		                 hardSkin, *m_tempAllocator);
 	}
 
 	// ---- serialized shapes: appended at the iPhysics vtable END (ABI) ----
@@ -1016,7 +1213,24 @@ public:
 				{}, {}, *m_tempAllocator);
 			c.character->UpdateGroundVelocity();   // AFTER the move: next step reads current motion
 		}
-		m_system->Update(dt, 1, m_tempAllocator.get(), m_jobSystem.get());
+		// NUKE_PHYS_PERF=1: per-scene average solver cost, printed once a second of steps.
+		static const bool perf = std::getenv("NUKE_PHYS_PERF") != nullptr;
+		if (perf)
+		{
+			const auto t0 = std::chrono::steady_clock::now();
+			m_system->Update(dt, 1, m_tempAllocator.get(), m_jobSystem.get());
+			const double ms = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - t0).count();
+			m_perfAcc += ms;
+			if (++m_perfN >= 60)
+			{
+				printf("[JoltPerf]\tscene %p step avg %.2f ms (%u bodies)\n",
+				       (void*)this, m_perfAcc / m_perfN, m_system->GetNumActiveBodies(JPH::EBodyType::SoftBody));
+				m_perfAcc = 0.0; m_perfN = 0;
+			}
+		}
+		else
+			m_system->Update(dt, 1, m_tempAllocator.get(), m_jobSystem.get());
 	}
 
 	// ---- characters: appended at the iPhysics vtable END (ABI) ----
@@ -1249,6 +1463,10 @@ public:
 	void shutdown()
 	{
 		reset();
+		// One empty step after the sweep: the broad-phase QuadTree frees the removed bodies'
+		// nodes LAZILY on the next update — destroying the system right away trips its
+		// free-list destructor assert (first seen with soft bodies).
+		if (m_system) step(1.0f / 60.0f);
 		m_system.reset();
 		m_jobSystem.reset();
 		m_tempAllocator.reset();
@@ -1272,6 +1490,8 @@ private:
 
 	std::unique_ptr<JPH::TempAllocatorImpl>    m_tempAllocator;
 	std::unique_ptr<NukeJobSystem>             m_jobSystem;   // solver jobs on nuke::Jobs
+	double m_perfAcc = 0.0;   // NUKE_PHYS_PERF accumulators
+	int    m_perfN = 0;
 	std::unique_ptr<JPH::PhysicsSystem>        m_system;
 	std::unordered_set<JPH::uint32>            m_bodies;      // live handles (reset/validation)
 
