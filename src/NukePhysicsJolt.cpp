@@ -61,6 +61,8 @@
 #include <thread>
 #include <map>
 #include <unordered_set>
+#include <cmath>
+#include <unordered_map>
 #include <vector>
 
 using std::cout;
@@ -321,6 +323,8 @@ public:
 			m_system->RemoveConstraint(kv.second);
 		}
 		m_vehicles.clear();
+		m_vehBase.clear();
+		m_timeScale.clear();
 		for (auto& kv : m_joints) m_system->RemoveConstraint(kv.second);
 		m_joints.clear();
 		for (auto& kv : m_constraints) m_system->RemoveConstraint(kv.second.first);
@@ -538,6 +542,134 @@ public:
 		if (!m_system || !handle) return;
 		JPH::Vec3 av = m_system->GetBodyInterface().GetAngularVelocity(JPH::BodyID((JPH::uint32)handle));
 		v[0] = av.GetX(); v[1] = av.GetY(); v[2] = av.GetZ();
+	}
+
+	// Soft bodies carry their motion per vertex: the rigid velocity is only a summary.
+	static JPH::SoftBodyMotionProperties* SoftMP(JPH::Body& b)
+	{
+		return b.IsSoftBody() ? static_cast<JPH::SoftBodyMotionProperties*>(b.GetMotionProperties()) : nullptr;
+	}
+	// A vehicle on a scaled chassis: forces act over the real dt, so torque/brake go x s^2 and the
+	// suspension frequency x s (damping is a ratio) — the car then obeys its own, slower clock.
+	void VehicleTimeScale(JPH::uint32 chassis, float s)
+	{
+		for (auto& kv : m_vehicles)
+		{
+			JPH::VehicleConstraint* vc = kv.second;
+			if (!vc || vc->GetVehicleBody()->GetID().GetIndexAndSequenceNumber() != chassis) continue;
+			auto bit = m_vehBase.find(kv.first);
+			if (bit == m_vehBase.end()) continue;
+			const VehicleBase& vb = bit->second;
+			static_cast<JPH::WheeledVehicleController*>(vc->GetController())->GetEngine().mMaxTorque = vb.maxTorque * s * s;
+			for (const VehicleBase::WheelBase& w : vb.wheels)
+			{
+				w.ws->mSuspensionSpring.mFrequency = w.frequency * s;
+				w.ws->mMaxBrakeTorque = w.brake * s * s;
+				w.ws->mMaxHandBrakeTorque = w.handBrake * s * s;
+			}
+		}
+	}
+	void setBodyTimeScale(uint64_t handle, float s) override
+	{
+		if (!m_system || !handle) return;
+		const JPH::uint32 id = (JPH::uint32)handle;
+		if (!m_bodies.count(id)) return;
+		if (s < 0.0f) s = 0.0f;
+		JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID(id));
+		if (!lock.Succeeded()) return;
+		JPH::Body& b = lock.GetBody();
+		if (b.IsStatic()) return;
+		JPH::SoftBodyMotionProperties* soft = SoftMP(b);
+		if (std::fabs(s - 1.0f) < 1e-6f)
+		{
+			auto it = m_timeScale.find(id);
+			if (it == m_timeScale.end()) return;
+			if (it->second.s <= 0.0f) Thaw(b, soft, it->second);
+			b.GetMotionProperties()->SetGravityFactor(1.0f);
+			m_timeScale.erase(it);
+			VehicleTimeScale(id, 1.0f);
+			return;
+		}
+		TimeScaleRec& r = m_timeScale[id];
+		if (r.s <= 0.0f && s > 0.0f) Thaw(b, soft, r);
+		r.s = s;
+		b.GetMotionProperties()->SetGravityFactor(s * s);   // x += v s dt with v scaled by s: gravity must add g s dt -> factor s^2
+		VehicleTimeScale(id, s);
+	}
+	template <class Rec>   // TimeScaleRec (declared below; a parameter list can't see it yet)
+	static void Thaw(JPH::Body& b, JPH::SoftBodyMotionProperties* soft, const Rec& r)
+	{
+		if (soft)
+		{
+			JPH::Array<JPH::SoftBodyVertex>& vs = soft->GetVertices();
+			for (size_t i = 0; i < vs.size() && i < r.vv.size(); ++i) vs[i].mVelocity = r.vv[i];
+			return;
+		}
+		b.SetLinearVelocity(r.v); b.SetAngularVelocity(r.w);
+	}
+	// Around one solve: v -> v s (frozen bodies park their velocity and stand still), then back.
+	// Kinematic bodies are skipped: their driver already moved them by a scaled displacement.
+	void TimeScalePre()
+	{
+		if (m_timeScale.empty()) return;
+		for (auto& kv : m_timeScale)
+		{
+			if (!m_bodies.count(kv.first)) continue;
+			JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID(kv.first));
+			if (!lock.Succeeded()) continue;
+			JPH::Body& b = lock.GetBody();
+			if (!b.IsDynamic() && !b.IsSoftBody()) continue;
+			TimeScaleRec& r = kv.second;
+			JPH::SoftBodyMotionProperties* soft = SoftMP(b);
+			if (r.s <= 0.0f)
+			{
+				if (soft)
+				{
+					JPH::Array<JPH::SoftBodyVertex>& vs = soft->GetVertices();
+					bool moving = false;
+					for (const JPH::SoftBodyVertex& v : vs) if (v.mVelocity.LengthSq() > 0.0f) { moving = true; break; }
+					if (moving) { r.vv.resize(vs.size()); for (size_t i = 0; i < vs.size(); ++i) r.vv[i] = vs[i].mVelocity; }
+					for (JPH::SoftBodyVertex& v : vs) v.mVelocity = JPH::Vec3::sZero();
+				}
+				else
+				{
+					const JPH::Vec3 v = b.GetLinearVelocity(), w = b.GetAngularVelocity();
+					if (v.LengthSq() > 0.0f || w.LengthSq() > 0.0f) { r.v = v; r.w = w; }   // a push while frozen is dropped
+					b.SetLinearVelocity(JPH::Vec3::sZero()); b.SetAngularVelocity(JPH::Vec3::sZero());
+				}
+				b.GetMotionProperties()->SetGravityFactor(0.0f);
+			}
+			else if (soft)
+			{
+				for (JPH::SoftBodyVertex& v : soft->GetVertices()) v.mVelocity *= r.s;
+			}
+			else
+			{
+				b.SetLinearVelocity(b.GetLinearVelocity() * r.s);
+				b.SetAngularVelocity(b.GetAngularVelocity() * r.s);
+			}
+		}
+	}
+	void TimeScalePost()
+	{
+		if (m_timeScale.empty()) return;
+		for (auto& kv : m_timeScale)
+		{
+			const TimeScaleRec& r = kv.second;
+			if (!m_bodies.count(kv.first) || r.s <= 0.0f) continue;
+			JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID(kv.first));
+			if (!lock.Succeeded()) continue;
+			JPH::Body& b = lock.GetBody();
+			if (!b.IsDynamic() && !b.IsSoftBody()) continue;
+			if (JPH::SoftBodyMotionProperties* soft = SoftMP(b))
+			{
+				for (JPH::SoftBodyVertex& v : soft->GetVertices()) v.mVelocity /= r.s;
+				b.SetLinearVelocity(b.GetLinearVelocity() / r.s);   // the summary velocity follows
+				continue;
+			}
+			b.SetLinearVelocity(b.GetLinearVelocity() / r.s);
+			b.SetAngularVelocity(b.GetAngularVelocity() / r.s);
+		}
 	}
 
 	int fetchContacts(NukeContactEvent* out, int max) override
@@ -806,12 +938,14 @@ public:
 	{
 		if (!m_system || !d.chassis || !d.wheels || d.wheelCount < 1) return 0;
 		JPH::Ref<JPH::VehicleConstraint> vc;
+		VehicleBase base;
 		{
 			JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID((JPH::uint32)d.chassis));
 			if (!lock.Succeeded()) return 0;
 			JPH::VehicleConstraintSettings vs;
 			auto* controller = new JPH::WheeledVehicleControllerSettings();
 			controller->mEngine.mMaxTorque = d.maxTorque;
+			base.maxTorque = d.maxTorque;
 			controller->mEngine.mMaxRPM = d.maxRPM;
 			int prevDriven = -1;
 			for (int i = 0; i < d.wheelCount; ++i)
@@ -828,6 +962,7 @@ public:
 				ws->mMaxSteerAngle = w.maxSteerDeg * 0.01745329252f;
 				ws->mMaxBrakeTorque = w.maxBrakeTorque;
 				ws->mMaxHandBrakeTorque = w.maxHandBrakeTorque;
+				base.wheels.push_back({ ws, w.frequency, w.maxBrakeTorque, w.maxHandBrakeTorque });
 				vs.mWheels.push_back(ws);
 				if (w.driven)
 				{
@@ -862,6 +997,10 @@ public:
 		m_system->GetBodyInterface().ActivateBody(JPH::BodyID((JPH::uint32)d.chassis));
 		const uint64_t id = m_nextJoint++;
 		m_vehicles[id] = vc;
+		m_vehBase[id] = base;
+		// A chassis already living in local time: the car takes it from the start.
+		auto ts = m_timeScale.find((JPH::uint32)d.chassis);
+		if (ts != m_timeScale.end()) VehicleTimeScale((JPH::uint32)d.chassis, ts->second.s);
 		return id;
 	}
 
@@ -872,6 +1011,7 @@ public:
 		m_system->RemoveStepListener(it->second);
 		m_system->RemoveConstraint(it->second);
 		m_vehicles.erase(it);
+		m_vehBase.erase(v);
 	}
 
 	void setVehicleInput(uint64_t v, float forward, float right, float brake, float handBrake) override
@@ -1213,6 +1353,7 @@ public:
 				{}, {}, *m_tempAllocator);
 			c.character->UpdateGroundVelocity();   // AFTER the move: next step reads current motion
 		}
+		TimeScalePre();   // local time (TimeVolume): scaled bodies enter the solve at v s
 		// NUKE_PHYS_PERF=1: per-scene average solver cost, printed once a second of steps.
 		static const bool perf = std::getenv("NUKE_PHYS_PERF") != nullptr;
 		if (perf)
@@ -1231,6 +1372,7 @@ public:
 		}
 		else
 			m_system->Update(dt, 1, m_tempAllocator.get(), m_jobSystem.get());
+		TimeScalePost();   // ...and leave it at their real velocity
 	}
 
 	// ---- characters: appended at the iPhysics vtable END (ABI) ----
@@ -1494,6 +1636,17 @@ private:
 	int    m_perfN = 0;
 	std::unique_ptr<JPH::PhysicsSystem>        m_system;
 	std::unordered_set<JPH::uint32>            m_bodies;      // live handles (reset/validation)
+	// Local time (setBodyTimeScale): per-body factor + the velocities parked while frozen.
+	struct TimeScaleRec { float s = 1.0f; JPH::Vec3 v = JPH::Vec3::sZero(), w = JPH::Vec3::sZero(); std::vector<JPH::Vec3> vv; /* soft: per vertex */ };
+	std::unordered_map<JPH::uint32, TimeScaleRec> m_timeScale;
+	// Vehicles' authored forces (setBodyTimeScale on the chassis rescales from these).
+	struct VehicleBase
+	{
+		struct WheelBase { JPH::WheelSettingsWV* ws; float frequency, brake, handBrake; };
+		float maxTorque = 0.0f;
+		std::vector<WheelBase> wheels;
+	};
+	std::map<uint64_t, VehicleBase> m_vehBase;
 
 	// Virtual-capsule character controllers, stepped in step().
 	struct CharRec
