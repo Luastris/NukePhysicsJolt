@@ -596,6 +596,15 @@ public:
 		b.GetMotionProperties()->SetGravityFactor(s * s);   // x += v s dt with v scaled by s: gravity must add g s dt -> factor s^2
 		VehicleTimeScale(id, s);
 	}
+	void setBodyFriction(uint64_t handle, float friction, float restitution) override
+	{
+		if (!m_system || !handle) return;
+		const JPH::uint32 id = (JPH::uint32)handle;
+		if (!m_bodies.count(id)) return;
+		JPH::BodyInterface& bi = m_system->GetBodyInterface();
+		bi.SetFriction(JPH::BodyID(id), std::max(friction, 0.0f));
+		bi.SetRestitution(JPH::BodyID(id), std::min(std::max(restitution, 0.0f), 1.0f));
+	}
 	template <class Rec>   // TimeScaleRec (declared below; a parameter list can't see it yet)
 	static void Thaw(JPH::Body& b, JPH::SoftBodyMotionProperties* soft, const Rec& r)
 	{
