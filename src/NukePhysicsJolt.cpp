@@ -157,6 +157,12 @@ public:
 		e.normal[0] = manifold.mWorldSpaceNormal.GetX();
 		e.normal[1] = manifold.mWorldSpaceNormal.GetY();
 		e.normal[2] = manifold.mWorldSpaceNormal.GetZ();
+		// the closing speed before the solve (surface velocities at the contact point, spin included)
+		{
+			const JPH::Vec3 va = a.IsStatic() ? JPH::Vec3::sZero() : a.GetPointVelocity(p);
+			const JPH::Vec3 vb = b.IsStatic() ? JPH::Vec3::sZero() : b.GetPointVelocity(p);
+			e.speed = std::fabs((va - vb).Dot(manifold.mWorldSpaceNormal));
+		}
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_events.push_back(e);
 	}
