@@ -35,6 +35,7 @@
 #include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Vehicle/VehicleConstraint.h>
 #include <Jolt/Physics/Vehicle/WheeledVehicleController.h>
+#include <Jolt/Physics/Vehicle/TrackedVehicleController.h>
 #include <Jolt/Physics/Vehicle/VehicleCollisionTester.h>
 #include <Jolt/Physics/Body/BodyLockMulti.h>
 #include <Jolt/Core/StreamWrapper.h>
@@ -330,6 +331,8 @@ public:
 		}
 		m_vehicles.clear();
 		m_vehBase.clear();
+		if (m_hoverStepper.added) { m_system->RemoveStepListener(&m_hoverStepper); m_hoverStepper.added = false; }
+		m_hovers.clear();
 		m_timeScale.clear();
 		for (auto& kv : m_joints) m_system->RemoveConstraint(kv.second);
 		m_joints.clear();
@@ -566,14 +569,25 @@ public:
 			auto bit = m_vehBase.find(kv.first);
 			if (bit == m_vehBase.end()) continue;
 			const VehicleBase& vb = bit->second;
+			if (vb.type == 1)
+			{
+				auto* tc = static_cast<JPH::TrackedVehicleController*>(vc->GetController());
+				tc->GetEngine().mMaxTorque = vb.maxTorque * s * s;
+				for (int t = 0; t < (int)JPH::ETrackSide::Num; ++t) tc->GetTracks()[t].mMaxBrakeTorque = vb.trackBrake * s * s;
+				for (const VehicleBase::WheelBase& w : vb.wheels) w.ws->mSuspensionSpring.mFrequency = w.frequency * s;
+				continue;
+			}
 			static_cast<JPH::WheeledVehicleController*>(vc->GetController())->GetEngine().mMaxTorque = vb.maxTorque * s * s;
 			for (const VehicleBase::WheelBase& w : vb.wheels)
 			{
-				w.ws->mSuspensionSpring.mFrequency = w.frequency * s;
-				w.ws->mMaxBrakeTorque = w.brake * s * s;
-				w.ws->mMaxHandBrakeTorque = w.handBrake * s * s;
+				auto* ws = static_cast<JPH::WheelSettingsWV*>(w.ws);
+				ws->mSuspensionSpring.mFrequency = w.frequency * s;
+				ws->mMaxBrakeTorque = w.brake * s * s;
+				ws->mMaxHandBrakeTorque = w.handBrake * s * s;
 			}
 		}
+		for (auto& kv : m_hovers)
+			if (kv.second.body == chassis) kv.second.s = s;   // forces x s^2, lift spring x s (StepHovers)
 	}
 	void setBodyTimeScale(uint64_t handle, float s) override
 	{
@@ -952,6 +966,8 @@ public:
 	uint64_t createVehicle(const NukeVehicleDesc& d) override
 	{
 		if (!m_system || !d.chassis || !d.wheels || d.wheelCount < 1) return 0;
+		if (d.type == 2) return CreateHover(d);
+		if (d.type == 1) return CreateTracked(d);
 		JPH::Ref<JPH::VehicleConstraint> vc;
 		VehicleBase base;
 		{
@@ -1019,10 +1035,172 @@ public:
 		return id;
 	}
 
+	// Tracked: Jolt's TrackedVehicleController - the road wheels split into a left and a right
+	// track by side, the engine drives both through the gear box, steering scales each track's
+	// rate (setVehicleInput). Every track needs at least one wheel.
+	uint64_t CreateTracked(const NukeVehicleDesc& d)
+	{
+		JPH::Ref<JPH::VehicleConstraint> vc;
+		VehicleBase base;
+		base.type = 1;
+		{
+			JPH::BodyLockWrite lock(m_system->GetBodyLockInterface(), JPH::BodyID((JPH::uint32)d.chassis));
+			if (!lock.Succeeded()) return 0;
+			JPH::VehicleConstraintSettings vs;
+			auto* controller = new JPH::TrackedVehicleControllerSettings();
+			controller->mEngine.mMaxTorque = d.maxTorque;
+			controller->mEngine.mMaxRPM = d.maxRPM;
+			base.maxTorque = d.maxTorque;
+			base.trackBrake = d.trackBrakeTorque;
+			int driven[2] = { -1, -1 };
+			for (int i = 0; i < d.wheelCount; ++i)
+			{
+				const NukeWheelDesc& w = d.wheels[i];
+				auto* ws = new JPH::WheelSettingsTV();
+				ws->mPosition = JPH::Vec3(w.pos[0], w.pos[1], w.pos[2]);
+				ws->mRadius = w.radius;
+				ws->mWidth = w.width;
+				ws->mSuspensionMinLength = w.suspensionMin;
+				ws->mSuspensionMaxLength = std::max(w.suspensionMax, w.suspensionMin + 0.01f);
+				ws->mSuspensionSpring = JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping, w.frequency, w.damping);
+				ws->mLongitudinalFriction = w.longFriction;
+				ws->mLateralFriction = w.latFriction;
+				base.wheels.push_back({ ws, w.frequency, 0.0f, 0.0f });
+				vs.mWheels.push_back(ws);
+				// Jolt's track 0 ("Left") is the +X side (forward +Z, right-handed: its right is -X); the
+				// engine's left is -X, so the engine-left wheels go to track 1 - then the steering below
+				// turns a tank the way it turns a car (stand-verified against a wheeled one).
+				const bool engineLeft = w.side >= 0 ? (w.side == 0) : (w.pos[0] < 0.0f);
+				const int side = engineLeft ? 1 : 0;
+				controller->mTracks[side].mWheels.push_back((JPH::uint)i);
+				if (driven[side] < 0 || (w.driven && !d.wheels[driven[side]].driven)) driven[side] = i;
+			}
+			if (driven[0] < 0 || driven[1] < 0)
+			{
+				for (JPH::WheelSettings* ws : vs.mWheels) delete ws;
+				delete controller;
+				return 0;   // a track without wheels
+			}
+			for (int t = 0; t < 2; ++t)
+			{
+				JPH::VehicleTrackSettings& tr = controller->mTracks[t];
+				tr.mDrivenWheel = (JPH::uint)driven[t];
+				tr.mInertia = d.trackInertia;
+				tr.mAngularDamping = d.trackDamping;
+				tr.mMaxBrakeTorque = d.trackBrakeTorque;
+				tr.mDifferentialRatio = d.trackDiffRatio;
+			}
+			vs.mController = controller;
+			vc = new JPH::VehicleConstraint(lock.GetBody(), vs);
+			vc->SetVehicleCollisionTester(new JPH::VehicleCollisionTesterCastCylinder(ObjLayers::MOVING));
+		}
+		m_system->AddConstraint(vc);
+		m_system->AddStepListener(vc);
+		m_system->GetBodyInterface().ActivateBody(JPH::BodyID((JPH::uint32)d.chassis));
+		const uint64_t id = m_nextJoint++;
+		m_vehicles[id] = vc;
+		m_vehBase[id] = base;
+		auto ts = m_timeScale.find((JPH::uint32)d.chassis);
+		if (ts != m_timeScale.end()) VehicleTimeScale((JPH::uint32)d.chassis, ts->second.s);
+		return id;
+	}
+
+	// Hover: no constraint. The thrusters are springs toward their hover height over whatever
+	// a ray down the chassis finds (StepHovers, a step listener); thrust / turn / grip / brake /
+	// self-righting act at the chassis while any thruster has ground under it.
+	uint64_t CreateHover(const NukeVehicleDesc& d)
+	{
+		HoverRec h;
+		h.body = (JPH::uint32)d.chassis;
+		if (!m_bodies.count(h.body)) return 0;
+		for (int i = 0; i < d.wheelCount; ++i)
+		{
+			const NukeWheelDesc& w = d.wheels[i];
+			HoverRec::Thruster t;
+			t.local = JPH::Vec3(w.pos[0], w.pos[1], w.pos[2]);
+			t.height = std::max(w.suspensionMax, 0.05f);
+			t.frequency = std::max(w.frequency, 0.1f);
+			t.damping = std::max(w.damping, 0.0f);
+			t.length = t.height;
+			h.thrusters.push_back(t);
+		}
+		h.thrust = d.hoverThrust; h.turn = d.hoverTurn; h.grip = d.hoverGrip;
+		h.upright = d.hoverUpright; h.angDamp = d.hoverAngularDamping; h.brakeForce = d.hoverBrake;
+		auto ts = m_timeScale.find(h.body);
+		if (ts != m_timeScale.end()) h.s = ts->second.s;
+		if (!m_hoverStepper.added)
+		{
+			m_hoverStepper.self = this;
+			m_system->AddStepListener(&m_hoverStepper);
+			m_hoverStepper.added = true;
+		}
+		m_system->GetBodyInterface().ActivateBody(JPH::BodyID(h.body));
+		const uint64_t id = m_nextJoint++;
+		m_hovers[id] = h;
+		return id;
+	}
+
+	// Before every physics step: lift springs + drive forces of every hover. The step holds the
+	// body mutexes already (NoLock interfaces), and the chassis is skipped when asleep.
+	void StepHovers(const JPH::PhysicsStepListenerContext& ctx)
+	{
+		JPH::PhysicsSystem* sys = ctx.mPhysicsSystem;
+		const float dt = ctx.mDeltaTime;
+		for (auto& kv : m_hovers)
+		{
+			HoverRec& h = kv.second;
+			JPH::BodyLockWrite lock(sys->GetBodyLockInterfaceNoLock(), JPH::BodyID(h.body));
+			if (!lock.Succeeded()) continue;
+			JPH::Body& b = lock.GetBody();
+			if (!b.IsActive() || !b.IsDynamic()) continue;
+			const float invM = b.GetMotionProperties()->GetInverseMass();
+			if (invM <= 0.0f) continue;
+			const float mass = 1.0f / invM, s = h.s, s2 = s * s;
+			const JPH::RMat44 xf = b.GetWorldTransform();
+			const JPH::Vec3 up = xf.GetAxisY(), fwd = xf.GetAxisZ();
+			const float share = mass / (float)std::max((int)h.thrusters.size(), 1);
+			bool grounded = false;
+			JPH::IgnoreSingleBodyFilter ignore{ b.GetID() };
+			for (HoverRec::Thruster& t : h.thrusters)
+			{
+				const JPH::RVec3 origin = xf * t.local;
+				const float castLen = t.height * 1.5f + 0.01f;   // see the ground a little past the hover height
+				JPH::RRayCast ray{ origin, -up * castLen };
+				JPH::ClosestHitCollisionCollector<JPH::CastRayCollector> col;
+				sys->GetNarrowPhaseQueryNoLock().CastRay(ray, JPH::RayCastSettings{}, col, {}, {}, ignore);
+				t.contact = col.HadHit();
+				t.length = t.contact ? col.mHit.mFraction * castLen : castLen;
+				if (!t.contact || t.length >= t.height) continue;
+				grounded = true;
+				const float w = 6.2831853f * t.frequency * s;
+				const float k = share * w * w, c = 2.0f * t.damping * std::sqrt(k * share);
+				const float vAlong = b.GetPointVelocity(origin).Dot(up);   // + = rising
+				const float force = std::max(k * (t.height - t.length) - c * vAlong, 0.0f);   // a spring that only pushes
+				b.AddForce(up * force, origin);
+			}
+			if (!grounded) continue;
+			const JPH::Vec3 vel = b.GetLinearVelocity();
+			const JPH::Vec3 right = fwd.Cross(up);
+			const float vF = vel.Dot(fwd), vR = vel.Dot(right);
+			JPH::Vec3 force = fwd * (h.inF * h.thrust * s2);
+			if (h.inB > 0.0f && std::fabs(vF) > 1e-3f)   // brake: against the forward motion, never past a stop
+				force -= fwd * std::min(h.inB * h.brakeForce * s2, std::fabs(vF) * mass / std::max(dt, 1e-4f)) * (vF > 0.0f ? 1.0f : -1.0f);
+			force -= right * std::min(h.grip * s, 1.0f / std::max(dt, 1e-4f)) * vR * mass;   // side grip
+			b.AddForce(force);
+			const JPH::Vec3 av = b.GetAngularVelocity();
+			JPH::Vec3 torque = up * (h.inR * h.turn * s2);
+			torque += up.Cross(JPH::Vec3::sAxisY()) * (h.upright * s2 * mass);   // self-righting toward world up
+			torque -= av * (std::min(h.angDamp * s, 1.0f / std::max(dt, 1e-4f)) * mass);
+			b.AddTorque(torque);
+		}
+	}
+
 	void destroyVehicle(uint64_t v) override
 	{
+		if (!m_system) return;
+		if (m_hovers.erase(v)) return;
 		auto it = m_vehicles.find(v);
-		if (it == m_vehicles.end() || !m_system) return;
+		if (it == m_vehicles.end()) return;
 		m_system->RemoveStepListener(it->second);
 		m_system->RemoveConstraint(it->second);
 		m_vehicles.erase(it);
@@ -1031,16 +1209,66 @@ public:
 
 	void setVehicleInput(uint64_t v, float forward, float right, float brake, float handBrake) override
 	{
+		const bool any = std::fabs(forward) > 0.01f || std::fabs(right) > 0.01f || brake > 0.01f || handBrake > 0.01f;
+		auto hit = m_hovers.find(v);
+		if (hit != m_hovers.end())
+		{
+			HoverRec& h = hit->second;
+			h.inF = std::clamp(forward, -1.0f, 1.0f); h.inR = std::clamp(right, -1.0f, 1.0f);
+			h.inB = std::clamp(std::max(brake, handBrake), 0.0f, 1.0f);
+			if (any) m_system->GetBodyInterface().ActivateBody(JPH::BodyID(h.body));
+			return;
+		}
 		auto it = m_vehicles.find(v);
 		if (it == m_vehicles.end()) return;
-		auto* c = static_cast<JPH::WheeledVehicleController*>(it->second->GetController());
-		c->SetDriverInput(forward, right, brake, handBrake);
-		if (std::fabs(forward) > 0.01f || std::fabs(right) > 0.01f || brake > 0.01f || handBrake > 0.01f)
-			m_system->GetBodyInterface().ActivateBody(it->second->GetVehicleBody()->GetID());
+		auto bit = m_vehBase.find(v);
+		if (bit != m_vehBase.end() && bit->second.type == 1)
+		{
+			// Tracks: steer slows the inner track down to counter-rotation at full lock; with no
+			// throttle the two tracks counter-rotate and the vehicle pivots in place.
+			float f = forward, l = 1.0f, r = 1.0f;
+			if (std::fabs(f) < 0.05f && std::fabs(right) > 0.05f)
+			{
+				f = std::fabs(right);
+				l = right > 0.0f ? 1.0f : -1.0f; r = -l;
+			}
+			else
+			{
+				const float inner = std::max(1.0f - std::fabs(right) * 1.5f, -1.0f);
+				if (right > 0.0f) r = inner; else if (right < 0.0f) l = inner;
+			}
+			if (std::fabs(l) < 0.01f) l = l < 0.0f ? -0.01f : 0.01f;   // Jolt: a ratio is never 0
+			if (std::fabs(r) < 0.01f) r = r < 0.0f ? -0.01f : 0.01f;
+			static_cast<JPH::TrackedVehicleController*>(it->second->GetController())
+				->SetDriverInput(f, l, r, std::max(brake, handBrake));
+		}
+		else
+		{
+			auto* c = static_cast<JPH::WheeledVehicleController*>(it->second->GetController());
+			c->SetDriverInput(forward, right, brake, handBrake);
+		}
+		if (any) m_system->GetBodyInterface().ActivateBody(it->second->GetVehicleBody()->GetID());
 	}
 
 	bool getWheelState(uint64_t v, int wheel, NukeWheelState& out) override
 	{
+		auto hit = m_hovers.find(v);
+		if (hit != m_hovers.end())
+		{
+			const HoverRec& h = hit->second;
+			if (wheel < 0 || wheel >= (int)h.thrusters.size()) return false;
+			JPH::BodyLockRead lock(m_system->GetBodyLockInterface(), JPH::BodyID(h.body));
+			if (!lock.Succeeded()) return false;
+			const HoverRec::Thruster& t = h.thrusters[wheel];
+			const JPH::RVec3 p = lock.GetBody().GetWorldTransform() * t.local;
+			const JPH::Quat q = lock.GetBody().GetRotation();
+			out.pos[0] = (float)p.GetX(); out.pos[1] = (float)p.GetY(); out.pos[2] = (float)p.GetZ();
+			out.quat[0] = q.GetX(); out.quat[1] = q.GetY(); out.quat[2] = q.GetZ(); out.quat[3] = q.GetW();
+			out.suspension = t.length;   // current height over the ground (hover height when nothing is in reach)
+			out.contact = t.contact ? 1 : 0;
+			out.longSlip = out.latSlip = 0.0f;
+			return true;
+		}
 		auto it = m_vehicles.find(v);
 		if (it == m_vehicles.end()) return false;
 		JPH::VehicleConstraint* c = it->second;
@@ -1053,25 +1281,43 @@ public:
 		const JPH::Wheel* w = c->GetWheel((JPH::uint)wheel);
 		out.suspension = w->GetSuspensionLength();
 		out.contact = w->HasContact() ? 1 : 0;
-		const auto* wv = static_cast<const JPH::WheelWV*>(w);
-		out.longSlip = wv->mLongitudinalSlip;
-		out.latSlip = wv->mLateralSlip;
+		auto bit = m_vehBase.find(v);
+		if (bit != m_vehBase.end() && bit->second.type == 1)
+		{
+			out.longSlip = out.latSlip = 0.0f;   // a track pad: Jolt reports no slip for it
+		}
+		else
+		{
+			const auto* wv = static_cast<const JPH::WheelWV*>(w);
+			out.longSlip = wv->mLongitudinalSlip;
+			out.latSlip = wv->mLateralSlip;
+		}
 		return true;
 	}
 
 	float vehicleRPM(uint64_t v) override
 	{
+		if (m_hovers.count(v)) return 0.0f;   // no engine model: thrust is the input itself
 		auto it = m_vehicles.find(v);
 		if (it == m_vehicles.end()) return 0.0f;
+		auto bit = m_vehBase.find(v);
+		if (bit != m_vehBase.end() && bit->second.type == 1)
+			return static_cast<JPH::TrackedVehicleController*>(it->second->GetController())->GetEngine().GetCurrentRPM();
 		return static_cast<JPH::WheeledVehicleController*>(it->second->GetController())->GetEngine().GetCurrentRPM();
 	}
 
 	float vehicleSpeed(uint64_t v) override
 	{
-		auto it = m_vehicles.find(v);
-		if (it == m_vehicles.end()) return 0.0f;
-		JPH::Body* b = it->second->GetVehicleBody();
-		JPH::BodyLockRead lock(m_system->GetBodyLockInterface(), b->GetID());
+		JPH::BodyID id;
+		auto hit = m_hovers.find(v);
+		if (hit != m_hovers.end()) id = JPH::BodyID(hit->second.body);
+		else
+		{
+			auto it = m_vehicles.find(v);
+			if (it == m_vehicles.end()) return 0.0f;
+			id = it->second->GetVehicleBody()->GetID();
+		}
+		JPH::BodyLockRead lock(m_system->GetBodyLockInterface(), id);
 		if (!lock.Succeeded()) return 0.0f;
 		const JPH::Body& body = lock.GetBody();
 		return body.GetRotation().RotateAxisZ().Dot(body.GetLinearVelocity());
@@ -1657,11 +1903,32 @@ private:
 	// Vehicles' authored forces (setBodyTimeScale on the chassis rescales from these).
 	struct VehicleBase
 	{
-		struct WheelBase { JPH::WheelSettingsWV* ws; float frequency, brake, handBrake; };
+		struct WheelBase { JPH::WheelSettings* ws; float frequency, brake, handBrake; };   // WV or TV settings by type
+		int   type = 0;             // 0 wheeled, 1 tracked
 		float maxTorque = 0.0f;
+		float trackBrake = 0.0f;
 		std::vector<WheelBase> wheels;
 	};
 	std::map<uint64_t, VehicleBase> m_vehBase;
+
+	// Hover vehicles (type 2): stepped by one step listener, no constraint.
+	struct HoverRec
+	{
+		struct Thruster { JPH::Vec3 local; float height, frequency, damping; float length = 0.0f; bool contact = false; };
+		JPH::uint32 body = 0;
+		std::vector<Thruster> thrusters;
+		float thrust = 0, turn = 0, grip = 0, upright = 0, angDamp = 0, brakeForce = 0;
+		float inF = 0, inR = 0, inB = 0;
+		float s = 1.0f;             // local time scale of the chassis
+	};
+	std::map<uint64_t, HoverRec> m_hovers;
+	struct HoverStepper final : public JPH::PhysicsStepListener
+	{
+		JoltPhysics* self = nullptr;
+		bool added = false;
+		void OnStep(const JPH::PhysicsStepListenerContext& ctx) override { if (self) self->StepHovers(ctx); }
+	};
+	HoverStepper m_hoverStepper;
 
 	// Virtual-capsule character controllers, stepped in step().
 	struct CharRec
